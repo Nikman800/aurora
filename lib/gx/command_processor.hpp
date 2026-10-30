@@ -23,4 +23,14 @@ bool has_address_resolver() noexcept;
 // are readable; `available` (optional) receives the readable size.
 const uint8_t* resolve_address(uint32_t address, uint32_t minSize, uint32_t* available = nullptr) noexcept;
 
+// Textures and TLUTs loaded by BP registers, resolved through the address resolver.
+// A texture map's BP registers changed:
+void mark_guest_texture(uint32_t texMapId) noexcept;
+// A TLUT load (BP 0x64 address, BP 0x65 TMEM offset and size):
+void load_guest_tlut(uint32_t loadTlut0, uint32_t loadTlut1) noexcept;
+// The texture cache was invalidated (BP 0x66): re-read texture memory on next use.
+void invalidate_guest_textures() noexcept;
+// Texture maps that came from GX_AURORA_LOAD_TEXOBJ are no longer resolved from BP registers.
+void forget_guest_texture(uint32_t texMapId) noexcept;
+
 } // namespace aurora::gx::fifo

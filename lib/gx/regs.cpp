@@ -287,6 +287,11 @@ void bp_efb_copy(u8, u32 value) noexcept {
 
 // TLUT load trigger (0x65)
 void bp_tlut_load(u8, u32 value) noexcept {
+  if (has_address_resolver()) {
+    // Hardware encoding: TMEM offset (512-byte units) and size (16-entry lines)
+    load_guest_tlut(g_gxState.bpRegCache[0x64], value);
+    return;
+  }
   const auto idx = reg_get(value, 10, 0);
   if (idx < MaxTluts) {
     auto& slot = g_gxState.loadedTluts[idx];
@@ -485,6 +490,9 @@ void bp_tex(u8 reg, u32 value) noexcept {
   const u32 kind = (idx & 0x1F) / 4;
   const u32 texMapId = (idx & 3) + (idx >= 0x20 ? 4 : 0);
   auto& slot = g_gxState.loadedTextures[texMapId];
+  if (has_address_resolver()) {
+    mark_guest_texture(texMapId);
+  }
   switch (kind) {
   case 0: // Mode0
     slot.mode0 = value;
@@ -503,6 +511,13 @@ void bp_tex(u8 reg, u32 value) noexcept {
     break;
   default:
     break;
+  }
+}
+
+// Texture cache invalidation (0x66)
+void bp_tex_invalidate(u8, u32) noexcept {
+  if (has_address_resolver()) {
+    invalidate_guest_textures();
   }
 }
 
@@ -551,6 +566,7 @@ constexpr auto kBpRegs = [] {
   regs[0x59] = {bp_scissor};
   regs[0x64] = {}; // TLUT load address; bp_tlut_load reads from shadow
   regs[0x65] = {bp_tlut_load, DirtyTextures, /* alwaysHandle */ true};
+  regs[0x66] = {bp_tex_invalidate, DirtyTextures, /* alwaysHandle */ true};
   for (u32 base : {0x80u, 0xA0u}) {
     for (u32 i = 0; i < 4; ++i) {
       regs[base + 0x00 + i] = {bp_tex, DirtyTextures}; // Mode0
@@ -559,7 +575,7 @@ constexpr auto kBpRegs = [] {
       regs[base + 0x0C + i] = {};                      // Image1 (GXTexRegion)
       regs[base + 0x10 + i] = {};                      // Image2 (GXTexRegion)
       regs[base + 0x14 + i] = {bp_tex, DirtyTextures}; // Image3
-      regs[base + 0x18 + i] = {};                      // TLUT region TMEM offset
+      regs[base + 0x18 + i] = {bp_tex, DirtyTextures}; // TLUT region TMEM offset and format
     }
   }
   for (u8 r = 0xC0; r <= 0xDE; r += 2) {

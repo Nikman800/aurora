@@ -1,5 +1,6 @@
 #include "command_processor.hpp"
 
+#include "../gfx/hash.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
@@ -14,6 +15,9 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <bitset>
+#include <map>
+#include <tuple>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -198,6 +202,116 @@ gfx::Range push_fog_range_lut(const FogRangeLutKey& key) {
 
 AddressResolver sAddressResolver = nullptr;
 void* sAddressResolverUserData = nullptr;
+
+// Textures and TLUTs from BP registers: there is no texture object, so each distinct
+// (address, layout) gets a stable id, and its version changes when the bytes in memory
+// change, checked after each texture cache invalidation.
+struct GuestObject {
+  u32 id = 0;
+  u32 version = 0;
+  HashType hash = 0;
+  u32 checkedGeneration = 0;
+};
+using GuestKey = std::tuple<u32, u32, u32>;
+std::map<GuestKey, GuestObject> sGuestObjects;
+u32 sNextGuestId = 0x80000000u;
+u32 sGuestGeneration = 1;
+std::bitset<MaxTextures> sGuestTexPending;
+std::bitset<MaxTextures> sGuestTexMaps;
+// TLUT slots hold TLUTs loaded to TMEM; each remembers its TMEM offset (+1; 0: free).
+std::array<u32, MaxTluts> sGuestTlutTmem{};
+std::array<u32, MaxTluts> sGuestTlutAddress{};
+u32 sGuestTlutNext = 0;
+
+GuestObject& guest_object(const GuestKey& key, const u8* data, u32 size) noexcept {
+  auto& obj = sGuestObjects[key];
+  if (obj.id == 0) {
+    obj.id = sNextGuestId++;
+    obj.version = 1;
+    obj.hash = xxh3_hash_s(data, size);
+    obj.checkedGeneration = sGuestGeneration;
+  } else if (obj.checkedGeneration != sGuestGeneration) {
+    const HashType hash = xxh3_hash_s(data, size);
+    if (hash != obj.hash) {
+      obj.hash = hash;
+      ++obj.version;
+    }
+    obj.checkedGeneration = sGuestGeneration;
+  }
+  return obj;
+}
+
+u32 guest_tlut_slot(u32 tmem) noexcept {
+  for (u32 i = 0; i < MaxTluts; ++i) {
+    if (sGuestTlutTmem[i] == tmem + 1) {
+      return i;
+    }
+  }
+  return MaxTluts;
+}
+
+void resolve_guest_texture(u32 texMapId) noexcept {
+  auto& slot = g_gxState.loadedTextures[texMapId];
+  const u32 address = (slot.image3 & 0xFFFFFF) << 5;
+  const u32 width = (slot.image0 & 0x3FF) + 1;
+  const u32 height = ((slot.image0 >> 10) & 0x3FF) + 1;
+  const u32 format = (slot.image0 >> 20) & 0xF;
+  // Mipmapped when the minification filter uses mipmaps; levels up to the max LOD.
+  const bool mips = ((slot.mode0 >> 5) & 3) != 0;
+  const u32 levels = mips ? ((slot.mode1 >> 8) & 0xFF) / 16 + 1 : 1;
+  const u32 size = GXGetTexBufferSize(width, height, format, mips, levels);
+  const u8* data = resolve_address(address, size);
+  slot.data = data;
+  slot.mWidth = width;
+  slot.mHeight = height;
+  slot.mFormat = format;
+  slot.flags = (slot.flags & 0x80) | (mips ? 1 : 0);
+  if (data == nullptr) {
+    slot.texObjId = 0;
+    return;
+  }
+  const auto& obj = guest_object({address, slot.image0 & 0xFFFFFF, levels}, data, size);
+  slot.texObjId = obj.id;
+  slot.texDataVersion = obj.version;
+  if (format != GX_TF_C4 && format != GX_TF_C8 && format != GX_TF_C14X2) {
+    slot.flags |= 2;
+    return;
+  }
+  // TLUT: TMEM offset and format from the texture map's TLUT register (BP 0x98/0xB8)
+  const u32 tlutReg = g_gxState.bpRegCache[(texMapId < 4 ? 0x98 : 0xB8) + (texMapId & 3)];
+  const u32 tlutIdx = guest_tlut_slot(tlutReg & 0x3FF);
+  if (tlutIdx == MaxTluts) {
+    Log.error("Texture map {} uses TMEM TLUT 0x{:03X}, which was never loaded", texMapId, tlutReg & 0x3FF);
+    slot.data = nullptr;
+    slot.texObjId = 0;
+    return;
+  }
+  slot.tlut = static_cast<GXTlut>(tlutIdx);
+  auto& tlut = g_gxState.loadedTluts[tlutIdx];
+  tlut.format = static_cast<GXTlutFmt>((tlutReg >> 10) & 3);
+  if (tlut.data == nullptr) {
+    return;
+  }
+  const auto& tlutObj = guest_object({sGuestTlutAddress[tlutIdx], tlut.numEntries, 0x100u | tlut.format},
+                                     static_cast<const u8*>(tlut.data), tlut.numEntries * 2u);
+  if (tlut.tlutObjId != tlutObj.id || tlut.tlutDataVersion != tlutObj.version) {
+    tlut.tlutObjId = tlutObj.id;
+    tlut.tlutDataVersion = tlutObj.version;
+    texture::invalidate_bindings();
+  }
+}
+
+void resolve_guest_textures() noexcept {
+  if (sGuestTexPending.none()) {
+    return;
+  }
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    if (sGuestTexPending.test(i)) {
+      resolve_guest_texture(i);
+    }
+  }
+  sGuestTexPending.reset();
+}
 
 u8 line_mode_for_prim(GXPrimitive prim) noexcept {
   switch (prim) {
@@ -457,6 +571,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
   if (!bindGroupsValid) {
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
+    resolve_guest_textures();
     resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
     cache.bindGeneration = texture::current_bind_generation();
@@ -696,6 +811,7 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_LOAD_TEXOBJ) {
     const auto texMapId = reader.read<u8>();
     CHECK(texMapId < MaxTextures, "invalid texture map id {}", texMapId);
+    forget_guest_texture(texMapId);
     auto& slot = g_gxState.loadedTextures[texMapId];
     const auto newData = reinterpret_cast<const void*>(reader.read<u64>());
     const u32 newWidth = reader.read<u32>();
@@ -876,6 +992,42 @@ const u8* resolve_address(u32 address, u32 minSize, u32* available) noexcept {
     *available = size;
   }
   return ptr;
+}
+
+void mark_guest_texture(u32 texMapId) noexcept {
+  sGuestTexPending.set(texMapId);
+  sGuestTexMaps.set(texMapId);
+}
+
+void forget_guest_texture(u32 texMapId) noexcept {
+  sGuestTexPending.reset(texMapId);
+  sGuestTexMaps.reset(texMapId);
+}
+
+void load_guest_tlut(u32 loadTlut0, u32 loadTlut1) noexcept {
+  const u32 tmem = loadTlut1 & 0x3FF;
+  const u32 entries = ((loadTlut1 >> 10) & 0x7FF) * 16;
+  const u32 address = (loadTlut0 & 0xFFFFFF) << 5;
+  u32 idx = guest_tlut_slot(tmem);
+  if (idx == MaxTluts) {
+    idx = sGuestTlutNext;
+    sGuestTlutNext = (sGuestTlutNext + 1) % MaxTluts;
+    sGuestTlutTmem[idx] = tmem + 1;
+  }
+  sGuestTlutAddress[idx] = address;
+  auto& tlut = g_gxState.loadedTluts[idx];
+  tlut.data = resolve_address(address, entries * 2);
+  tlut.numEntries = static_cast<u16>(entries);
+  // Ids and versions are assigned when a texture uses it (the format comes from the texture).
+  tlut.tlutObjId = 0;
+  tlut.tlutDataVersion = 0;
+  sGuestTexPending |= sGuestTexMaps;
+  texture::invalidate_bindings();
+}
+
+void invalidate_guest_textures() noexcept {
+  ++sGuestGeneration;
+  sGuestTexPending |= sGuestTexMaps;
 }
 
 void clear_draw_cache() noexcept {
