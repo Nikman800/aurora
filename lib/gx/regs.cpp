@@ -947,9 +947,10 @@ void xf_load_viewport(const u8* data) noexcept {
   f32 oz = read_bits<f32>(data + 20);
   f32 width = sx * 2.0f;
   f32 height = -sy * 2.0f;
+  // The XF viewport origin carries the hardware's 342-pixel offset
   set_logical_viewport({
-      .left = ox - 340.0f - width / 2.0f,
-      .top = oy - 340.0f - height / 2.0f,
+      .left = ox - 342.0f - width / 2.0f,
+      .top = oy - 342.0f - height / 2.0f,
       .width = width,
       .height = height,
       .znear = (oz - sz) / 1.6777215e7f,
