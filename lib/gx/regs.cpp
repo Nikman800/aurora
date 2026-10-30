@@ -136,14 +136,15 @@ void bp_scissor(u8, u32) noexcept {
   const u32 scis1 = g_gxState.bpRegCache[0x21];
 
   const u32 boxOffset = g_gxState.bpRegCache[0x59];
-  // The box offset fields are signed 9-bit values and also halved, like the viewport registers. Sign extend.
-  const s32 offsX = static_cast<s32>(reg_get(boxOffset, 10, 0)) << 23 >> 22;
-  const s32 offsY = static_cast<s32>(reg_get(boxOffset, 10, 10)) << 23 >> 22;
+  // The box offset fields hold (offset + 342) / 2; the hardware subtracts twice the field
+  // from the scissor coordinates (which carry the same +342 bias).
+  const s32 offsX = static_cast<s32>(reg_get(boxOffset, 10, 0)) * 2;
+  const s32 offsY = static_cast<s32>(reg_get(boxOffset, 10, 10)) * 2;
 
-  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) + offsY;
-  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) + offsX;
-  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) + offsY;
-  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) + offsX;
+  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) - offsY;
+  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) - offsX;
+  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) - offsY;
+  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) - offsX;
   const s32 wd = std::max(rt - lf + 1, 0);
   const s32 ht = std::max(bm - tp + 1, 0);
   set_logical_scissor({lf, tp, wd, ht});
