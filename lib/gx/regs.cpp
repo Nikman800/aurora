@@ -1,5 +1,6 @@
 #include "regs.hpp"
 
+#include "command_processor.hpp"
 #include "gx_fmt.hpp"
 #include "texture.hpp"
 
@@ -683,8 +684,30 @@ void cp_vat_c(u8 addr, u32 value) noexcept {
   g_gxState.clearVtxSizeCache();
 }
 
-void cp_arraybase_unsupported(u8, u32) noexcept {
-  Log.error("CP_REG_ARRAYBASE_ID is not supported. Use GX_AURORA_LOAD_ARRAYBASE instead.");
+// Array base addresses (0xA0-0xAF), resolved through the address resolver.
+void cp_array_base(u8 addr, u32 value) noexcept {
+  if (!has_address_resolver()) {
+    Log.error("CP_REG_ARRAYBASE_ID needs an address resolver (AuroraSetAddressResolver); "
+              "use GX_AURORA_LOAD_ARRAYBASE instead.");
+    return;
+  }
+  const u32 attrIdx = addr - 0xA0 + GX_VA_POS;
+  auto& array = g_gxState.arrays[attrIdx];
+  u32 available = 0;
+  const u8* data = resolve_address(value, 1, &available);
+  if (array.le) {
+    // Endianness is baked into the shader
+    g_gxState.dirty |= DirtyPipeline;
+  }
+  array.data = data;
+  array.le = false;
+  array.guest = true;
+  array.guestAvailable = data != nullptr ? available : 0;
+  // Vertex attribute arrays are sized by the draws that index them; the matrix and
+  // light arrays (indexed XF loads) by what is mapped.
+  array.size = attrIdx >= GX_POS_MTX_ARRAY ? array.guestAvailable : 0;
+  array.cachedRange = {};
+  g_gxState.dirty |= DirtyImmediates;
 }
 
 // Array strides (0xB0-0xBF)
@@ -707,7 +730,7 @@ constexpr auto kCpRegs = [] {
     regs[0x90 + i] = {cp_vat_c, DirtyPipeline};
   }
   for (u8 i = 0; i < 0x10; ++i) {
-    regs[0xA0 + i] = {cp_arraybase_unsupported, 0, /* alwaysHandle */ true};
+    regs[0xA0 + i] = {cp_array_base, 0, /* alwaysHandle */ true};
     regs[0xB0 + i] = {cp_array_stride, DirtyPipeline};
   }
   return regs;

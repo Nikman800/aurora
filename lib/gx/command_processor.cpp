@@ -494,6 +494,51 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices);
 }
 
+// Arrays set by CP array base registers have no size: make what is uploaded cover the
+// largest index this draw uses.
+static void size_guest_arrays(GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* vtxData) noexcept {
+  auto& state = g_gxState;
+  const auto& vtxFmt = state.vtxFmts[fmt];
+  u32 offset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const GXAttrType type = state.vtxDesc[i];
+    if (type == GX_NONE) {
+      continue;
+    }
+    if (type == GX_DIRECT) {
+      offset += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      continue;
+    }
+    const bool nbt3 = i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
+    const u32 idxSize = type == GX_INDEX16 ? 2 : 1;
+    const u32 numIdx = nbt3 ? 3 : 1;
+    auto& array = state.arrays[i];
+    if (array.guest && array.data != nullptr) {
+      u32 maxIdx = 0;
+      for (u32 v = 0; v < vtxCount; ++v) {
+        const u8* p = vtxData + v * vtxSize + offset;
+        for (u32 k = 0; k < numIdx; ++k) {
+          const u32 idx = idxSize == 2 ? (static_cast<u32>(p[2 * k]) << 8 | p[2 * k + 1]) : p[k];
+          maxIdx = std::max(maxIdx, idx);
+        }
+      }
+      u32 elemSize = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      if (nbt3) {
+        elemSize /= 3;
+      }
+      const u32 needed = std::min((maxIdx * array.stride + elemSize + 31) & ~31u, array.guestAvailable);
+      if (needed > array.size) {
+        array.size = needed;
+        array.cachedRange = {};
+        state.dirty |= DirtyImmediates;
+      }
+    }
+    offset += idxSize * numIdx;
+  }
+}
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
   u32 vtxSize;
@@ -505,6 +550,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+  if (has_address_resolver()) {
+    size_guest_arrays(fmt, vtxCount, vtxSize, reader.data() + reader.offset());
+  }
 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
@@ -613,6 +661,7 @@ void handle_aurora(ByteReader& reader) noexcept {
       array.size = arraySize;
       array.le = le;
       array.cachedRange = {};
+      array.guest = false;
       g_gxState.dirty |= DirtyImmediates;
     }
   } else if (subCmd == GX_AURORA_LOAD_TEXOBJ) {

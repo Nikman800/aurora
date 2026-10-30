@@ -299,6 +299,10 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  // Set by a CP array base register (resolved address): `size` grows with the indices
+  // that draws use, up to `guestAvailable`.
+  bool guest = false;
+  u32 guestAvailable = 0;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
