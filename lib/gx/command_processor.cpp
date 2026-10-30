@@ -196,6 +196,9 @@ gfx::Range push_fog_range_lut(const FogRangeLutKey& key) {
   return gfx::push_storage(reinterpret_cast<const u8*>(lut.data()), lut.size() * sizeof(f32));
 }
 
+AddressResolver sAddressResolver = nullptr;
+void* sAddressResolverUserData = nullptr;
+
 u8 line_mode_for_prim(GXPrimitive prim) noexcept {
   switch (prim) {
   case GX_LINES:
@@ -772,6 +775,29 @@ void handle_aurora(ByteReader& reader) noexcept {
   else {
     Log.error("Unknown Aurora subcommand: {:04X}", subCmd);
   }
+}
+
+void set_address_resolver(AddressResolver resolver, void* userData) noexcept {
+  sAddressResolver = resolver;
+  sAddressResolverUserData = userData;
+}
+
+bool has_address_resolver() noexcept { return sAddressResolver != nullptr; }
+
+const u8* resolve_address(u32 address, u32 minSize, u32* available) noexcept {
+  if (sAddressResolver == nullptr) {
+    return nullptr;
+  }
+  u32 size = 0;
+  const auto* ptr = static_cast<const u8*>(sAddressResolver(address, &size, sAddressResolverUserData));
+  if (ptr == nullptr || size < minSize) {
+    Log.error("Unresolved address 0x{:08X} ({} bytes needed, {} available)", address, minSize, ptr ? size : 0);
+    return nullptr;
+  }
+  if (available != nullptr) {
+    *available = size;
+  }
+  return ptr;
 }
 
 void clear_draw_cache() noexcept {

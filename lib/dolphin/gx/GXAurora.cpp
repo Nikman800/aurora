@@ -7,6 +7,7 @@
 #include "../../window.hpp"
 
 #include "../../gfx/readback/readback.hpp"
+#include "../../gx/command_processor.hpp"
 #include "../../gx/fifo.hpp"
 #include "../../gx/readback.hpp"
 
@@ -49,6 +50,10 @@ void AuroraGetRenderSize(u32* width, u32* height) {
 void AuroraGXSync() {
   GXFlush();
   aurora::gx::fifo::drain();
+}
+
+void AuroraSetAddressResolver(AuroraAddressResolver resolver, void* userData) {
+  aurora::gx::fifo::set_address_resolver(resolver, userData);
 }
 
 void AuroraSetDrawsBlocking(bool blocking) {

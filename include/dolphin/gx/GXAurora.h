@@ -179,6 +179,26 @@ void AuroraGXSync(void);
 void AuroraSetDrawsBlocking(bool blocking);
 
 /**
+ * Resolves a 32-bit address that appears in the raw GX command stream (as written by
+ * a GX encoder that runs against emulated console memory) to host memory.
+ *
+ * Returns a pointer to the bytes at `address`, or NULL when the address is not mapped,
+ * and stores the number of bytes readable from that pointer in `size`.
+ * The resolver is called from the FIFO processing thread.
+ */
+typedef const void* (*AuroraAddressResolver)(u32 address, u32* size, void* userData);
+
+/**
+ * Installs (or, with NULL, removes) the address resolver. It applies to commands processed after
+ * the call, so call it while no commands are being processed (before the first frame, or after
+ * AuroraGXSync).
+ * While a resolver is installed, the command processor also accepts these hardware commands:
+ * CP array base registers (0xA0-0xAF), GX_CMD_CALL_DL, and the BP texture image / TLUT
+ * load registers.
+ */
+void AuroraSetAddressResolver(AuroraAddressResolver resolver, void* userData);
+
+/**
  * Sets the actual render viewport in native framebuffer coordinates.
  * Overrides the automatically scaled values set by the logical GXSetViewport.
  */
