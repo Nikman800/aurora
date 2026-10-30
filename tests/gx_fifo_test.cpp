@@ -3928,3 +3928,129 @@ TEST_F(GXFifoTest, Composite_TevSetup) {
   EXPECT_EQ(g_gxState.tevStages[0].colorPass.d, GX_CC_TEXC);
   EXPECT_EQ(g_gxState.tevStages[0].alphaPass.d, GX_CA_TEXA);
 }
+
+// ============================================================================
+// Address resolver: hardware commands that carry 32-bit addresses
+// ============================================================================
+
+namespace {
+// 64 KiB of "guest memory" at address 0x00100000.
+constexpr u32 kGuestBase = 0x00100000;
+std::array<u8, 0x10000> sGuestMemory{};
+
+const void* resolve_guest(u32 address, u32* size, void*) {
+  const u32 phys = address & 0x3FFFFFFF;
+  if (phys < kGuestBase || phys - kGuestBase >= sGuestMemory.size()) {
+    return nullptr;
+  }
+  *size = static_cast<u32>(sGuestMemory.size()) - (phys - kGuestBase);
+  return sGuestMemory.data() + (phys - kGuestBase);
+}
+
+void put_be32(std::vector<u8>& out, u32 v) {
+  out.push_back(static_cast<u8>(v >> 24));
+  out.push_back(static_cast<u8>(v >> 16));
+  out.push_back(static_cast<u8>(v >> 8));
+  out.push_back(static_cast<u8>(v));
+}
+
+class GXResolverTest : public GXFifoTest {
+protected:
+  void SetUp() override {
+    GXFifoTest::SetUp();
+    sGuestMemory.fill(0);
+    AuroraSetAddressResolver(resolve_guest, nullptr);
+  }
+  void TearDown() override {
+    AuroraSetAddressResolver(nullptr, nullptr);
+    GXFifoTest::TearDown();
+  }
+};
+} // namespace
+
+TEST_F(GXResolverTest, CpArrayBaseResolvesGuestAddress) {
+  std::vector<u8> bytes{GX_LOAD_CP_REG, 0xA0};
+  put_be32(bytes, 0x80000000 | (kGuestBase + 0x200)); // cached address: the CP masks it
+  bytes.insert(bytes.end(), {GX_LOAD_CP_REG, 0xB0});
+  put_be32(bytes, 12);
+  decode_fifo(bytes);
+
+  const auto& array = g_gxState.arrays[GX_VA_POS];
+  EXPECT_EQ(array.data, sGuestMemory.data() + 0x200);
+  EXPECT_TRUE(array.guest);
+  EXPECT_FALSE(array.le);
+  EXPECT_EQ(array.stride, 12);
+  EXPECT_EQ(array.size, 0u); // sized by the draws that index it
+  EXPECT_EQ(array.guestAvailable, sGuestMemory.size() - 0x200);
+}
+
+TEST_F(GXResolverTest, CpMatrixArrayBaseIsSizedByMappedMemory) {
+  std::vector<u8> bytes{GX_LOAD_CP_REG, 0xAC}; // position matrix array
+  put_be32(bytes, kGuestBase);
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.arrays[GX_POS_MTX_ARRAY].size, sGuestMemory.size());
+}
+
+TEST_F(GXResolverTest, CpArrayBaseWithoutResolverIsIgnored) {
+  AuroraSetAddressResolver(nullptr, nullptr);
+  std::vector<u8> bytes{GX_LOAD_CP_REG, 0xA0};
+  put_be32(bytes, kGuestBase);
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.arrays[GX_VA_POS].data, nullptr);
+  EXPECT_FALSE(g_gxState.arrays[GX_VA_POS].guest);
+}
+
+TEST_F(GXResolverTest, CallDisplayListRunsGuestList) {
+  const std::array<u8, 5> list{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+  std::copy(list.begin(), list.end(), sGuestMemory.begin() + 0x100);
+  std::vector<u8> bytes{GX_CMD_CALL_DL};
+  put_be32(bytes, kGuestBase + 0x100);
+  put_be32(bytes, static_cast<u32>(list.size()));
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXResolverTest, NestedCallDisplayListStopsAtDepthLimit) {
+  // A list that writes a BP register and then calls itself.
+  std::vector<u8> list{GX_LOAD_BP_REG, 0x41, 0x00, 0x00, 0x01, GX_CMD_CALL_DL};
+  put_be32(list, kGuestBase);
+  put_be32(list, 14);
+  std::copy(list.begin(), list.end(), sGuestMemory.begin());
+  std::vector<u8> bytes{GX_CMD_CALL_DL};
+  put_be32(bytes, kGuestBase);
+  put_be32(bytes, 14);
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41000001u);
+}
+
+TEST_F(GXResolverTest, TlutLoadUsesHardwareEncoding) {
+  std::vector<u8> bytes{GX_LOAD_BP_REG};
+  put_be32(bytes, 0x64000000 | ((kGuestBase + 0x400) >> 5)); // TLUT address
+  bytes.push_back(GX_LOAD_BP_REG);
+  put_be32(bytes, 0x65000000 | (2 << 10) | 0x200); // 2 lines (32 entries) to TMEM 0x200
+  decode_fifo(bytes);
+
+  const auto it = std::find_if(g_gxState.loadedTluts.begin(), g_gxState.loadedTluts.end(),
+                               [](const auto& tlut) { return tlut.data == sGuestMemory.data() + 0x400; });
+  ASSERT_NE(it, g_gxState.loadedTluts.end());
+  EXPECT_EQ(it->numEntries, 32u);
+}
+
+TEST_F(GXResolverTest, ScissorBoxOffsetUsesHardwareEncoding) {
+  GXSetScissor(10, 20, 100, 50);
+  GXSetScissorBoxOffset(0, 0);
+  auto bytes = capture_fifo();
+  EXPECT_TRUE(has_bp_write(bytes, 0x59));
+  // (0 + 342) / 2 in both fields
+  u32 value = 0;
+  for (size_t i = 0; i + 4 < bytes.size(); ++i) {
+    if (bytes[i] == GX_LOAD_BP_REG && bytes[i + 1] == 0x59) {
+      value = static_cast<u32>(bytes[i + 2]) << 16 | static_cast<u32>(bytes[i + 3]) << 8 | bytes[i + 4];
+    }
+  }
+  EXPECT_EQ(value, (171u << 10) | 171u);
+}
