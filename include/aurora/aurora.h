@@ -183,6 +183,13 @@ typedef struct {
    * compiled from scratch and nothing is read from or written to those files.
    */
   bool disableShaderCache;
+
+  /*
+   * Application-defined key for the on-disk pipeline cache. Pipelines recorded under a different key, such as by
+   * an earlier build of the application (or of Aurora with local changes), are discarded at startup instead of
+   * being loaded. Defaults to 0.
+   */
+  uint32_t pipelineCacheKey;
 } AuroraConfig;
 
 typedef struct {

@@ -783,6 +783,34 @@ INSERT INTO aurora_schema VALUES ({});)",
       }
     }
 
+    // Discard pipelines recorded under a different application cache key.
+    if (!schemaFailed) {
+      ret = sqlite::exec(g_pipelineCacheDb, "CREATE TABLE IF NOT EXISTS aurora_cache_key(value INTEGER);");
+      const auto expectedKey = fmt::format("{}", g_config.pipelineCacheKey);
+      bool hasKey = false;
+      bool keyMatch = false;
+      if (ret == SQLITE_OK) {
+        ret = sqlite::exec(g_pipelineCacheDb, "SELECT value FROM aurora_cache_key",
+                           [&](int count, char** values, char**) {
+                             hasKey = true;
+                             keyMatch = count == 1 && values[0] != nullptr && expectedKey == values[0];
+                           });
+      }
+      if (ret == SQLITE_OK && !keyMatch) {
+        if (hasKey) {
+          Log.info("Pipeline cache key changed; discarding cached pipelines");
+        }
+        const auto keySql = fmt::format(
+            "DELETE FROM pipeline_cache; DELETE FROM aurora_cache_key; INSERT INTO aurora_cache_key VALUES ({});",
+            g_config.pipelineCacheKey);
+        ret = sqlite::exec(g_pipelineCacheDb, keySql.c_str());
+      }
+      if (ret != SQLITE_OK) {
+        Log.error("Failed to check pipeline cache key: {}", sqlite3_errmsg(g_pipelineCacheDb));
+        schemaFailed = true;
+      }
+    }
+
     if (!schemaFailed) {
       tx.commit();
     }
