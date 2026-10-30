@@ -712,7 +712,7 @@ static void seed_pipeline_cache() {
 }
 
 static bool prepare_pipeline_cache_db() {
-  if (g_pipelineCacheBroken) {
+  if (g_pipelineCacheBroken || g_config.disableShaderCache) {
     return false;
   }
   if (g_pipelineCacheDb != nullptr) {

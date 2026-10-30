@@ -201,7 +201,7 @@ static bool fill_used_key_table(const std::vector<XXH128_hash_t>& usedKeys) {
 }
 
 static bool cache_init() {
-  if (cache_broken) {
+  if (cache_broken || g_config.disableShaderCache) {
     return false;
   }
 

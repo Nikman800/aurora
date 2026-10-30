@@ -177,6 +177,12 @@ typedef struct {
   uint32_t mem2Size;
 
   AuroraSurfaceDesc surface;
+
+  /*
+   * Disables the on-disk shader caches (pipeline_cache.db and dawn_cache.db in cachePath): every pipeline is
+   * compiled from scratch and nothing is read from or written to those files.
+   */
+  bool disableShaderCache;
 } AuroraConfig;
 
 typedef struct {
