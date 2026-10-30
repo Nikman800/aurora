@@ -216,7 +216,35 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
 
-ProcessResult process(const u8* data, u32 size) noexcept {
+// Display lists called by GX_CMD_CALL_DL may call others, up to this depth.
+constexpr u32 MaxCallDepth = 8;
+
+static ProcessResult process_commands(const u8* data, u32 size, u32 depth) noexcept;
+
+// GX_CMD_CALL_DL: run the display list at a resolved address.
+static void call_display_list(u32 address, u32 size, u32 depth) noexcept {
+  if (!has_address_resolver()) {
+    Log.warn("Ignoring GX_CMD_CALL_DL without an address resolver");
+    return;
+  }
+  if (depth >= MaxCallDepth) {
+    Log.error("GX_CMD_CALL_DL nested deeper than {} levels; ignoring 0x{:08X}", MaxCallDepth, address);
+    return;
+  }
+  const u8* list = resolve_address(address, size);
+  if (list == nullptr) {
+    return;
+  }
+  u32 offset = 0;
+  while (offset < size) {
+    // A draw done inside a display list does not end the caller's batch.
+    offset += process_commands(list + offset, size - offset, depth + 1).bytesProcessed;
+  }
+}
+
+ProcessResult process(const u8* data, u32 size) noexcept { return process_commands(data, size, 0); }
+
+static ProcessResult process_commands(const u8* data, u32 size, u32 depth) noexcept {
   ZoneScoped;
   ByteReader reader{{data, size}};
 
@@ -280,8 +308,9 @@ ProcessResult process(const u8* data, u32 size) noexcept {
 
     case CP_CMD_CALL_DL: {
       // Call display list: 8 bytes (address + size)
-      Log.warn("Ignoring nested GX_CMD_CALL_DL");
-      reader.skip(8);
+      const u32 address = reader.read<u32>();
+      const u32 listSize = reader.read<u32>();
+      call_display_list(address, listSize, depth);
       break;
     }
 
