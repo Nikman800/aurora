@@ -261,6 +261,11 @@ struct PendingWriteback {
   AuroraReadbackStream stream = 0;
   u64 sequence = 0;
   AuroraReadbackStream sourceStream = 0; // EFB colour before the copy (source capture)
+  // The destination and a hash of its bytes when the copy was recorded: if the CPU writes there
+  // before the frame ends (the memory freed and reused, say), its bytes are newer than the copy's
+  // and the writeback is dropped.
+  const u8* dest = nullptr;
+  HashType destHash = 0;
 };
 std::vector<PendingWriteback> sPendingWritebacks;
 AuroraCopyWriteback sCopyWriteback = nullptr;
@@ -1219,10 +1224,13 @@ void guest_efb_copy(u32 copyReg) noexcept {
   copy_tex(dest, clear);
   g_gxState.pixelFmt = pixelFmt;
 
-  sGuestCopies[address] = {dest, size, xxh3_hash_s(dest, size), sGuestGeneration};
+  const HashType destHash = xxh3_hash_s(dest, size);
+  sGuestCopies[address] = {dest, size, destHash, sGuestGeneration};
   if (!writeback) {
     return;
   }
+  pending.dest = dest;
+  pending.destHash = destHash;
   pending.stream = gfx::readback::create_stream();
   pending.sequence = gfx::readback::next_sequence(pending.stream);
   const std::pair<u64, const void*> source{address, dest};
@@ -1256,10 +1264,19 @@ u32 flush_copy_writeback() noexcept {
   if (pending.empty()) {
     return 0;
   }
+  // A destination the CPU has written since its copy keeps the CPU's bytes: on the hardware the
+  // copy reached memory first. Checked for every copy before any is written back (two copies to
+  // one address in a frame both see the memory as it was).
+  std::vector<bool> cpuWritten(pending.size());
+  for (size_t i = 0; i < pending.size(); ++i) {
+    cpuWritten[i] = pending[i].dest != nullptr &&
+                    xxh3_hash_s(pending[i].dest, pending[i].info.size) != pending[i].destHash;
+  }
   // Everything recorded so far is submitted; the readback buffers map asynchronously.
   gfx::finish_gpu_work();
   u32 delivered = 0;
-  for (auto& item : pending) {
+  for (size_t i = 0; i < pending.size(); ++i) {
+    auto& item = pending[i];
     const auto packet = wait_packet(item.stream, item.sequence);
     const gfx::readback::Output* output = packet ? packet->find(item.info.address) : nullptr;
     std::shared_ptr<const gfx::readback::Packet> source;
@@ -1274,6 +1291,8 @@ u32 flush_copy_writeback() noexcept {
     }
     if (output == nullptr || output->payloadSize != item.info.size) {
       Log.error("Copy writeback of 0x{:08X} failed", item.info.address);
+    } else if (cpuWritten[i]) {
+      Log.debug("Copy writeback of 0x{:08X} dropped: the CPU wrote there after the copy", item.info.address);
     } else if (writeback != nullptr) {
       const auto payload = packet->payload_of(*output);
       item.info.data = payload.data();
