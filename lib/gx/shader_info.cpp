@@ -107,6 +107,70 @@ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& in
   }
 }
 
+// The TEV register (GX_TEVPREV..GX_TEVREG2) a colour argument reads, and whether it reads its alpha;
+// -1 for arguments that are not registers.
+int color_arg_tev_reg(GXTevColorArg arg, bool& alpha) {
+  alpha = arg == GX_CC_APREV || arg == GX_CC_A0 || arg == GX_CC_A1 || arg == GX_CC_A2;
+  switch (arg) {
+  case GX_CC_CPREV:
+  case GX_CC_APREV:
+    return GX_TEVPREV;
+  case GX_CC_C0:
+  case GX_CC_A0:
+    return GX_TEVREG0;
+  case GX_CC_C1:
+  case GX_CC_A1:
+    return GX_TEVREG1;
+  case GX_CC_C2:
+  case GX_CC_A2:
+    return GX_TEVREG2;
+  default:
+    return -1;
+  }
+}
+
+int alpha_arg_tev_reg(GXTevAlphaArg arg) {
+  switch (arg) {
+  case GX_CA_APREV:
+    return GX_TEVPREV;
+  case GX_CA_A0:
+    return GX_TEVREG0;
+  case GX_CA_A1:
+    return GX_TEVREG1;
+  case GX_CA_A2:
+    return GX_TEVREG2;
+  default:
+    return -1;
+  }
+}
+
+// A colour operation writes only a register's colour and an alpha operation only its alpha, so a
+// component read before any stage writes it is the register's value: load the register then. (A
+// register whose colour is written first otherwise started from zero, losing an alpha set with
+// GXSetTevColor that a later stage reads, e.g. A2 after a colour op into GX_TEVREG2.)
+void tev_reg_component_loads(const ShaderConfig& config, ShaderInfo& info) {
+  std::bitset<MaxTevRegs> colorWritten;
+  std::bitset<MaxTevRegs> alphaWritten;
+  const auto read = [&](int reg, bool alpha) {
+    if (reg >= 0 && !(alpha ? alphaWritten : colorWritten).test(reg)) {
+      info.loadsTevReg.set(reg);
+    }
+  };
+  for (int i = 0; i < config.tevStageCount; ++i) {
+    const auto& stage = config.tevStages[i];
+    for (const auto arg : {stage.colorPass.a, stage.colorPass.b, stage.colorPass.c, stage.colorPass.d}) {
+      bool alpha = false;
+      const int reg = color_arg_tev_reg(arg, alpha);
+      read(reg, alpha);
+    }
+    colorWritten.set(stage.colorOp.outReg);
+    for (const auto arg : {stage.alphaPass.a, stage.alphaPass.b, stage.alphaPass.c, stage.alphaPass.d}) {
+      read(alpha_arg_tev_reg(arg), true);
+    }
+    alphaWritten.set(stage.alphaOp.outReg);
+  }
+}
+
 void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
   case GX_CA_APREV:
@@ -270,6 +334,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.writesTevReg.set(stage.alphaOp.outReg);
     }
   }
+  tev_reg_component_loads(config, info);
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     // Skip if not enabled
