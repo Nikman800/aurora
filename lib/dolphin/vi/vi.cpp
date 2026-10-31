@@ -4,6 +4,7 @@
 #include "aurora/math.hpp"
 #include "vi_internal.hpp"
 
+#include <algorithm>
 #include <optional>
 
 namespace aurora::vi {
@@ -29,6 +30,13 @@ void configure(const GXRenderModeObj* rm) noexcept {
 }
 
 Vec2<uint32_t> configured_fb_size() noexcept { return render_mode_size(); }
+
+Vec2<uint32_t> configured_picture_size() noexcept {
+  if (!g_renderMode) {
+    return render_mode_size();
+  }
+  return {g_renderMode->fbWidth, std::min<uint32_t>(g_renderMode->xfbHeight, g_renderMode->efbHeight)};
+}
 } // namespace aurora::vi
 
 extern "C" {

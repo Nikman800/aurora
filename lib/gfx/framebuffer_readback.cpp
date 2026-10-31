@@ -1,4 +1,5 @@
 #include "efb.hpp"
+#include "recording.hpp"
 #include "render_worker.hpp"
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -22,8 +23,10 @@ static bool read_framebuffer(void* dst, size_t dstSize, uint32_t* outWidth, uint
     Log.error("No framebuffer to read back");
     return false;
   }
-  const uint32_t width = source.size.width;
-  const uint32_t height = source.size.height;
+  // The presented picture: the display copy's source rectangle
+  const auto rect = presented_efb_rect(source.size.width, source.size.height);
+  const uint32_t width = static_cast<uint32_t>(rect.width);
+  const uint32_t height = static_cast<uint32_t>(rect.height);
   if (outWidth != nullptr) {
     *outWidth = width;
   }
@@ -48,7 +51,10 @@ static bool read_framebuffer(void* dst, size_t dstSize, uint32_t* outWidth, uint
   };
   const auto buffer = webgpu::g_device.CreateBuffer(&bufferDescriptor);
   const auto encoder = webgpu::g_device.CreateCommandEncoder();
-  const wgpu::TexelCopyTextureInfo src{.texture = source.texture};
+  const wgpu::TexelCopyTextureInfo src{
+      .texture = source.texture,
+      .origin = {static_cast<uint32_t>(rect.x), static_cast<uint32_t>(rect.y), 0},
+  };
   const wgpu::TexelCopyBufferInfo dstInfo{
       .layout = {.offset = 0, .bytesPerRow = pitch, .rowsPerImage = height},
       .buffer = buffer,

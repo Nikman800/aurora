@@ -129,6 +129,9 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
 uint32_t align_uniform(uint32_t value);
 // The next frame starts with this frame's EFB contents (a display copy that did not clear it).
 void keep_efb_next_frame() noexcept;
+// The part of the EFB (render target pixels) the last recorded frame presents: the VI's picture size
+// (vi::configured_picture_size) from the top left.
+ClipRect presented_efb_rect(uint32_t efbWidth, uint32_t efbHeight) noexcept;
 // Waits until everything recorded so far is submitted to the GPU; then readback buffers complete
 // as poll_gpu_events processes the device's events.
 void finish_gpu_work() noexcept;

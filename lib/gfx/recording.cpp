@@ -12,6 +12,7 @@
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
+#include "../dolphin/vi/vi_internal.hpp"
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
@@ -23,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <ranges>
@@ -577,6 +579,50 @@ struct PresentPool {
   size_t used = 0;
 };
 std::array<PresentPool, FrameSlotCount> g_presentPools;
+std::array<PresentPool, FrameSlotCount> g_displayPools;
+
+std::mutex g_displayRectMutex;
+ClipRect g_displayRect{0, 0, 0, 0}; // render target pixels; empty: the whole EFB
+
+// The presented picture: the top of the EFB, the VI's picture size (render mode fbWidth x xfbHeight),
+// copied out when that is not the whole EFB. A render mode whose EFB is taller than its picture leaves
+// the lines below it as scratch space that is drawn into and copied from but never shown.
+webgpu::TextureWithSampler display_source(const webgpu::TextureWithSampler& efb) {
+  const auto [pictureWidth, pictureHeight] = vi::configured_picture_size();
+  const ClipRect rect = gx::map_logical_scissor(
+      {0, 0, static_cast<int32_t>(pictureWidth), static_cast<int32_t>(pictureHeight)});
+  const bool whole = rect.width <= 0 || rect.height <= 0 ||
+                     (rect.x == 0 && rect.y == 0 && static_cast<uint32_t>(rect.width) == efb.size.width &&
+                      static_cast<uint32_t>(rect.height) == efb.size.height);
+  {
+    std::lock_guard lock{g_displayRectMutex};
+    g_displayRect = whole ? ClipRect{0, 0, 0, 0} : rect;
+  }
+  if (whole || !efb.texture) {
+    return efb;
+  }
+
+  const auto width = static_cast<uint32_t>(rect.width);
+  const auto height = static_cast<uint32_t>(rect.height);
+  auto& pool = g_displayPools[g_recorder.frameSlot];
+  if (pool.used == pool.textures.size()) {
+    pool.textures.emplace_back();
+  }
+  auto& destination = pool.textures[pool.used++];
+  if (!destination.view || destination.size.width != width || destination.size.height != height ||
+      destination.format != efb.format) {
+    destination = webgpu::create_render_texture(width, height, false);
+  }
+  queue_texture_copy(
+      {
+          .texture = efb.texture,
+          .origin = {static_cast<uint32_t>(rect.x), static_cast<uint32_t>(rect.y), 0},
+      },
+      {.texture = destination.texture}, {width, height, 1});
+  auto source = destination;
+  source.sampler = efb.sampler;
+  return source;
+}
 
 present::Request record_present(present::TargetSnapshot target, webgpu::TextureWithSampler source,
                                 bool resample = true) {
@@ -648,6 +694,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.frameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
   g_presentPools[frameSlot].used = 0;
+  g_displayPools[frameSlot].used = 0;
   g_recorder.drawCallCount = 0;
   g_recorder.mergedDrawCallCount = 0;
   g_recorder.suspendedEfbPass.reset();
@@ -675,12 +722,13 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
 void record_xfb_present(imgui::DrawData drawData, wgpu::BindGroup rmlBindGroup, bool rmlOverlay) {
   auto& frame = current_frame_packet();
   const auto& efb = frame.efb;
+  const auto source = display_source(efb.present_source());
   if (!efb.xfb.state) {
     return;
   }
 
   const bool resample = !rmlBindGroup || rmlOverlay;
-  auto request = record_present(efb.xfb, efb.present_source(), resample);
+  auto request = record_present(efb.xfb, source, resample);
   request.primary = true;
   request.imguiDrawData = std::move(drawData);
   request.rmlBindGroup = std::move(rmlBindGroup);
@@ -727,6 +775,9 @@ void shutdown_recording() {
     pool = {};
   }
   for (auto& pool : g_presentPools) {
+    pool = {};
+  }
+  for (auto& pool : g_displayPools) {
     pool = {};
   }
   g_recorder.currentRenderPass = UINT32_MAX;
@@ -953,6 +1004,19 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
 }
 
 void keep_efb_next_frame() noexcept { detail::g_keepEfb.store(true); }
+
+ClipRect presented_efb_rect(uint32_t efbWidth, uint32_t efbHeight) noexcept {
+  ClipRect rect;
+  {
+    std::lock_guard lock{g_displayRectMutex};
+    rect = g_displayRect;
+  }
+  if (rect.width <= 0 || rect.height <= 0 || static_cast<uint32_t>(rect.x + rect.width) > efbWidth ||
+      static_cast<uint32_t>(rect.y + rect.height) > efbHeight) {
+    return {0, 0, static_cast<int32_t>(efbWidth), static_cast<int32_t>(efbHeight)};
+  }
+  return rect;
+}
 
 void finish_gpu_work() noexcept { render_worker::synchronize(); }
 
