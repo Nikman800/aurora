@@ -5,6 +5,7 @@
 #include "texture.hpp"
 
 #include <bit>
+#include <bitset>
 #include <cmath>
 
 namespace aurora::gx::fifo {
@@ -522,13 +523,20 @@ void bp_tex_invalidate(u8, u32) noexcept {
   }
 }
 
+// Unhandled registers are reported once each (debug level), in every build type.
+bool first_unhandled(u32 key) noexcept {
+  static std::bitset<0x300> seen;
+  if (seen.test(key)) {
+    return false;
+  }
+  seen.set(key);
+  return true;
+}
+
 void bp_unhandled(u8 reg, u32 value) noexcept {
-#ifndef NDEBUG
-  Log.debug("Unhandled BP register 0x{:02X} (value 0x{:06X})", reg, value & 0xFFFFFF);
-#else
-  (void)reg;
-  (void)value;
-#endif
+  if (first_unhandled(reg)) {
+    Log.debug("Unhandled BP register 0x{:02X} (value 0x{:06X})", reg, value & 0xFFFFFF);
+  }
 }
 
 constexpr auto kBpRegs = [] {
@@ -735,10 +743,21 @@ void cp_array_stride(u8 addr, u32 value) noexcept {
   }
 }
 
+void cp_unhandled(u8 addr, u32 value) noexcept {
+  if (first_unhandled(0x100 | addr)) {
+    Log.debug("Unhandled CP register 0x{:02X} (value 0x{:08X})", addr, value);
+  }
+}
+
+void cp_ignored(u8, u32) noexcept {}
+
 constexpr auto kCpRegs = [] {
   std::array<RegHandler, 0x100> regs{};
+  for (auto& reg : regs) {
+    reg = {cp_unhandled};
+  }
   regs[0x30] = {cp_mtx_index, DirtyImmediates};
-  regs[0x40] = {}; // Matrix index B; mirrors XF 0x19
+  regs[0x40] = {cp_ignored}; // Matrix index B; mirrors XF 0x19
   regs[0x50] = {cp_vcd_lo, DirtyPipeline};
   regs[0x60] = {cp_vcd_hi, DirtyPipeline};
   for (u8 i = 0; i < 8; ++i) {
@@ -879,12 +898,9 @@ void xf_clip_disable(u8, u32 value) noexcept {
 }
 
 void xf_unhandled(u8 reg, u32 value) noexcept {
-#ifndef NDEBUG
-  Log.debug("Unhandled XF register 0x{:04X} (value 0x{:08X})", static_cast<u32>(reg), value);
-#else
-  (void)reg;
-  (void)value;
-#endif
+  if (first_unhandled(0x200 | reg)) {
+    Log.debug("Unhandled XF register 0x{:04X} (value 0x{:08X})", static_cast<u32>(reg), value);
+  }
 }
 
 constexpr auto kXfRegs = [] {
@@ -1210,9 +1226,7 @@ void handle_xf(u16 addr, std::span<const u8> data) noexcept {
     return;
   }
   if (addr < 0x1000) {
-#ifndef NDEBUG
     Log.debug("Unhandled XF memory write 0x{:04X} ({} words)", addr, count);
-#endif
     return;
   }
 
@@ -1243,9 +1257,7 @@ void handle_xf(u16 addr, std::span<const u8> data) noexcept {
 
     const u32 val = read_bits<u32>(wordData);
     if (reg >= XfRegCount) {
-#ifndef NDEBUG
       Log.debug("Unhandled XF register 0x{:04X} (value 0x{:08X})", reg, val);
-#endif
       continue;
     }
     if (xf_reg_unchanged(reg, val)) {

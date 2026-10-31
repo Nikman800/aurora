@@ -413,9 +413,7 @@ static ProcessResult process_commands(const u8* data, u32 size, u32 depth) noexc
                     srcSize, array.size);
       auto const* srcData = static_cast<const u8*>(array.data) + srcOffset;
       if (!copy_xf_data(dstAddr, srcData, len, array.le ? std::endian::little : std::endian::big)) {
-#ifndef NDEBUG
-        Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
-#endif
+        Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr 0x{:04X})", opcode, dstAddr);
       }
       break;
     }
