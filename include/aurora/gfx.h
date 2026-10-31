@@ -37,6 +37,14 @@ float aurora_get_fps();
 void aurora_enable_vsync(bool enabled);
 
 /**
+ * Display aspect ratio (width / height) the main framebuffer is presented at. The framebuffer is
+ * letterboxed or pillarboxed into the window at this aspect instead of its own pixel aspect, as a TV
+ * shows a 4:3 or anamorphic 16:9 picture from the same framebuffer. Zero (the default) presents
+ * with square pixels.
+ */
+void aurora_set_present_aspect(float aspect);
+
+/**
  * Reads back the color contents of the main framebuffer (EFB) as of the last aurora_end_frame(), as RGBA8 rows from
  * top to bottom (width * 4 bytes per row). Waits for all submitted GPU work, so it is meant for tests and
  * screenshots, not for use every frame. width and height (optional) receive the framebuffer size even on failure.

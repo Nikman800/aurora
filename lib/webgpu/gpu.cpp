@@ -63,6 +63,7 @@ bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
 static std::atomic_bool g_vsyncEnabled = true;
+static std::atomic<float> g_presentAspect = 0.f;
 
 namespace {
 
@@ -297,16 +298,20 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
     return {};
   }
 
+  // Content aspect: the framebuffer's own (square pixels) unless a display aspect is set
+  double aspect = static_cast<double>(content_width) / static_cast<double>(content_height);
+  if (const float presentAspect = g_presentAspect.load(std::memory_order_acquire);
+      std::isfinite(presentAspect) && presentAspect > 0.f) {
+    aspect = presentAspect;
+  }
   uint32_t viewport_width = surface_width;
   uint32_t viewport_height = std::min<uint32_t>(
-      surface_height, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_width) *
-                                                                               static_cast<double>(content_height) /
-                                                                               static_cast<double>(content_width)))));
+      surface_height,
+      std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_width) / aspect))));
   if (viewport_height == surface_height) {
     viewport_width = std::min<uint32_t>(
-        surface_width, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_height) *
-                                                                                static_cast<double>(content_width) /
-                                                                                static_cast<double>(content_height)))));
+        surface_width,
+        std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_height) * aspect))));
   }
 
   return {
@@ -1070,6 +1075,11 @@ void resize_efb(uint32_t width, uint32_t height) {
   }
 }
 } // namespace aurora::webgpu
+
+void aurora_set_present_aspect(const float aspect) {
+  aurora::webgpu::g_presentAspect.store(std::isfinite(aspect) && aspect > 0.f ? aspect : 0.f,
+                                        std::memory_order_release);
+}
 
 void aurora_enable_vsync(const bool enabled) {
   aurora::webgpu::g_vsyncEnabled.store(enabled, std::memory_order_release);
