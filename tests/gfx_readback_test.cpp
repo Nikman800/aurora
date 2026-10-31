@@ -747,3 +747,407 @@ struct Out { @builtin(frag_depth) depth: f32 };
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------------------------------------------
+// Raw hardware streams through the address resolver: EFB copies to guest memory, copy writeback, display copies
+// without clear, Z textures and logic ops
+// ---------------------------------------------------------------------------------------------------------------
+
+namespace {
+constexpr u32 GuestBase = 0x00800000;
+alignas(32) std::array<u8, 1 << 20> sGuest{};
+
+const void* resolve_guest(u32 address, u32* size, void*) {
+  const u32 phys = address & 0x3FFFFFFF;
+  if (phys < GuestBase || phys - GuestBase >= sGuest.size()) {
+    return nullptr;
+  }
+  *size = static_cast<u32>(sGuest.size()) - (phys - GuestBase);
+  return sGuest.data() + (phys - GuestBase);
+}
+
+struct WrittenCopy {
+  AuroraCopyWritebackInfo info;
+  std::vector<u8> data;
+};
+std::vector<WrittenCopy> sWritten;
+
+void record_writeback(const AuroraCopyWritebackInfo* copy, void*) {
+  const auto* bytes = static_cast<const u8*>(copy->data);
+  sWritten.push_back({*copy, std::vector<u8>(bytes, bytes + copy->size)});
+  std::memcpy(sGuest.data() + (copy->address - GuestBase), copy->data, copy->size);
+}
+
+// A BP register write in the raw stream
+void bp(u32 value) {
+  gx::fifo::write_u8(GX_LOAD_BP_REG);
+  gx::fifo::write_u32(value);
+}
+
+// EFB copy registers as the SDK writes them (GXSetTexCopySrc/Dst, GXCopyTex): RGBA8 unless `format` (the 4-bit PE
+// copy format) is given, clamped top and bottom.
+void guest_copy(u32 left, u32 top, u32 width, u32 height, u32 address, bool half, bool clear, u32 format = 6,
+                bool intensity = false) {
+  bp(0x49000000 | left | (top << 10));
+  bp(0x4A000000 | (width - 1) | ((height - 1) << 10));
+  bp(0x4B000000 | (address >> 5));
+  bp(0x4D000000 | 0);
+  bp(0x52000000 | 3 | ((format >> 3) & 1) << 3 | (format & 7) << 4 | (half ? 1u : 0u) << 9 |
+     (clear ? 1u : 0u) << 11 | (intensity ? 3u : 2u) << 15);
+}
+
+void display_copy(bool clear) {
+  bp(0x49000000);
+  bp(0x4A000000 | (EfbWidth - 1) | ((EfbHeight - 1) << 10));
+  bp(0x4B000000 | ((GuestBase + 0x80000) >> 5));
+  bp(0x52000000 | 3 | (clear ? 1u : 0u) << 11 | 1u << 14);
+}
+
+// Texture map 0 from guest memory: nearest, clamped, no mipmaps
+void guest_texture(u32 address, u32 width, u32 height, u32 format) {
+  bp(0x80000000);
+  bp(0x84000000);
+  bp(0x88000000 | (width - 1) | (height - 1) << 10 | format << 20);
+  bp(0x94000000 | (address >> 5));
+}
+
+// Screen-space quads (EFB pixels), one TEV stage: texture map 0 (REPLACE) or the colour/alpha of TEV register 0
+void setup_2d(bool textured) {
+  GXSetViewport(0, 0, EfbWidth, EfbHeight, 0, 1);
+  GXSetScissor(0, 0, EfbWidth, EfbHeight);
+  f32 proj[4][4] = {};
+  proj[0][0] = 2.f / EfbWidth;
+  proj[0][3] = -1.f;
+  proj[1][1] = -2.f / EfbHeight;
+  proj[1][3] = 1.f;
+  proj[2][2] = -1.f;
+  proj[2][3] = -1.f;
+  proj[3][3] = 1.f;
+  GXSetProjection(proj, GX_ORTHOGRAPHIC);
+  f32 ident[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+  GXLoadPosMtxImm(ident, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+  GXSetNumChans(0);
+  GXSetNumTexGens(1);
+  GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, textured ? GX_TEXMAP0 : GX_TEXMAP_NULL, GX_COLOR_NULL);
+  if (textured) {
+    GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+  } else {
+    GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0);
+    GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_A0);
+    GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+  }
+  GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+  GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetColorUpdate(GX_TRUE);
+  GXSetAlphaUpdate(GX_TRUE);
+}
+
+void quad(f32 x0, f32 y0, f32 x1, f32 y1) {
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  GXPosition3f32(x0, y0, -0.5f);
+  GXTexCoord2f32(0, 0);
+  GXPosition3f32(x1, y0, -0.5f);
+  GXTexCoord2f32(1, 0);
+  GXPosition3f32(x1, y1, -0.5f);
+  GXTexCoord2f32(1, 1);
+  GXPosition3f32(x0, y1, -0.5f);
+  GXTexCoord2f32(0, 1);
+  GXEnd();
+}
+
+// Fills an EFB rectangle with a colour (a clearing copy to a scratch guest address)
+void fill(u32 x, u32 y, u32 w, u32 h, GXColor color) {
+  GXSetCopyClear(color, 0xFFFFFF);
+  guest_copy(x, y, w, h, GuestBase + 0xC0000, false, true);
+}
+
+// Texel (x, y) of an RGBA8 texture in the hardware layout: 4x4 tiles, AR then GB
+std::array<u8, 4> rgba8_texel(const std::vector<u8>& data, u32 width, u32 x, u32 y) {
+  const u32 tile = (y / 4) * ((width + 3) / 4) + x / 4;
+  const u32 i = (y % 4) * 4 + x % 4;
+  const u8* t = data.data() + tile * 64;
+  return {t[i * 2 + 1], t[32 + i * 2], t[32 + i * 2 + 1], t[i * 2]};
+}
+
+class GuestCopyGpuTest : public ReadbackGpuTest {
+protected:
+  void SetUp() override {
+    ReadbackGpuTest::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    sGuest.fill(0);
+    sWritten.clear();
+    AuroraSetAddressResolver(resolve_guest, nullptr);
+    AuroraSetCopyWriteback(record_writeback, nullptr, false);
+    AuroraSetDrawsBlocking(true); // no draw is skipped while its pipeline compiles
+  }
+  void TearDown() override {
+    AuroraSetCopyWriteback(nullptr, nullptr, false);
+    AuroraSetAddressResolver(nullptr, nullptr);
+  }
+
+  // ARGB (or Z) at EFB pixels, as of the end of `body`'s frame
+  static std::vector<u32> peek_after(const std::function<void()>& body, AuroraReadbackPeekKind kind,
+                                     const std::vector<std::pair<u16, u16>>& points) {
+    const auto stream = AuroraReadbackCreateStream();
+    run_frame([&] {
+      body();
+      std::vector<AuroraReadbackPeekRequest> requests;
+      for (u32 i = 0; i < points.size(); ++i) {
+        requests.push_back({i, kind, points[i].first, points[i].second});
+      }
+      EXPECT_TRUE(AuroraReadbackCapturePeeks(stream, requests.data(), static_cast<u32>(requests.size())));
+    });
+    std::vector<u32> values(points.size(), 0xDEADBEEF);
+    EXPECT_TRUE(wait_published(stream));
+    std::vector<AuroraReadbackDest> dests;
+    for (u32 i = 0; i < points.size(); ++i) {
+      dests.push_back({i, &values[i], sizeof(u32)});
+    }
+    EXPECT_TRUE(AuroraReadbackGet(stream, dests.data(), static_cast<u32>(dests.size())));
+    AuroraReadbackDestroyStream(stream);
+    return values;
+  }
+};
+
+constexpr u32 argb(GXColor c) { return u32{c.a} << 24 | u32{c.r} << 16 | u32{c.g} << 8 | c.b; }
+} // namespace
+
+TEST_F(GuestCopyGpuTest, HalfSizeCopyIsBoxFilteredAndWrittenBackInHardwareFormat) {
+  // 16x16 at (32, 32): A everywhere, B in odd columns, then C in odd rows: each 2x2 block is A, B, C, C
+  constexpr GXColor A{200, 0, 40, 255}, B{0, 100, 40, 255}, C{40, 60, 0, 255};
+  run_frame([] {
+    GXSetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+    fill(32, 32, 16, 16, A);
+    for (u32 x = 1; x < 16; x += 2) {
+      fill(32 + x, 32, 1, 16, B);
+    }
+    for (u32 y = 1; y < 16; y += 2) {
+      fill(32, 32 + y, 16, 1, C);
+    }
+    guest_copy(32, 32, 16, 16, GuestBase, true, false);
+  });
+  EXPECT_EQ(AuroraFlushCopyWriteback(), 1u + 1u + 8u + 8u); // the fills are copies too
+  const auto& copy = sWritten.back();
+  EXPECT_EQ(copy.info.address, GuestBase);
+  EXPECT_EQ(copy.info.format, static_cast<u32>(GX_TF_RGBA8));
+  EXPECT_EQ(copy.info.width, 8);
+  EXPECT_EQ(copy.info.height, 8);
+  EXPECT_TRUE(copy.info.half);
+  ASSERT_EQ(copy.data.size(), 8u * 8u * 4u);
+  for (u32 y = 0; y < 8; ++y) {
+    for (u32 x = 0; x < 8; ++x) {
+      const auto t = rgba8_texel(copy.data, 8, x, y);
+      EXPECT_NEAR(t[0], (A.r + B.r + 2 * C.r) / 4.0, 1.0) << x << "," << y;
+      EXPECT_NEAR(t[1], (A.g + B.g + 2 * C.g) / 4.0, 1.0) << x << "," << y;
+      EXPECT_NEAR(t[2], (A.b + B.b + 2 * C.b) / 4.0, 1.0) << x << "," << y;
+      EXPECT_EQ(t[3], 255) << x << "," << y;
+    }
+  }
+  // The writeback is what reached guest memory
+  EXPECT_EQ(std::memcmp(sGuest.data(), copy.data.data(), copy.data.size()), 0);
+}
+
+TEST_F(GuestCopyGpuTest, VerticalFilterBlendsTheRowsAboveAndBelow) {
+  // Rows alternate black and white; the SDK's copy filter registers with 16/32/16 weights
+  constexpr GXColor Black{0, 0, 0, 255}, White{255, 255, 255, 255};
+  run_frame([] {
+    GXSetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+    fill(0, 64, 8, 8, Black);
+    for (u32 y = 1; y < 8; y += 2) {
+      fill(0, 64 + y, 8, 1, White);
+    }
+    bp(0x53000000 | 8 | 8 << 6 | 10 << 12 | 11 << 18);
+    bp(0x54000000 | 11 | 8 << 6 | 8 << 12);
+    guest_copy(0, 64, 8, 8, GuestBase, false, false);
+    bp(0x53000000 | 21 << 12 | 22 << 18);
+    bp(0x54000000 | 21);
+  });
+  AuroraFlushCopyWriteback();
+  const auto& copy = sWritten.back();
+  EXPECT_TRUE(copy.info.vfilter);
+  for (u32 y = 1; y < 7; ++y) {
+    // above + below weigh 32/64, the row 32/64: black rows get 0.5, white rows 0.5 as well
+    const auto t = rgba8_texel(copy.data, 8, 3, y);
+    EXPECT_NEAR(t[0], 127.5, 1.5) << "row " << y;
+  }
+  // Top row clamped: the row above is the row itself (black): (16 + 32) * 0 + 16 * 255 / 64
+  EXPECT_NEAR(rgba8_texel(copy.data, 8, 3, 0)[0], 255.0 * 16 / 64, 1.5);
+}
+
+TEST_F(GuestCopyGpuTest, LaterTextureLoadSamplesTheCopyUntilMemoryChanges) {
+  constexpr GXColor Red{255, 0, 0, 255}, Blue{0, 0, 255, 255};
+  const std::vector<std::pair<u16, u16>> at{{100, 100}};
+  // Frame 1: copy an 8x8 red block to guest memory; the texture load samples the GPU copy
+  auto v = peek_after(
+      [] {
+        GXSetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+        fill(0, 0, 8, 8, Red);
+        guest_copy(0, 0, 8, 8, GuestBase, false, false);
+        setup_2d(true);
+        guest_texture(GuestBase, 8, 8, GX_TF_RGBA8);
+        quad(96, 96, 104, 104);
+      },
+      AURORA_READBACK_PEEK_ARGB, at);
+  EXPECT_EQ(v[0] & 0xFFFFFF, argb(Red) & 0xFFFFFF);
+  // The CPU writes a blue texture there and invalidates the texture cache: memory wins
+  AuroraFlushCopyWriteback();
+  for (u32 i = 0; i < 4; ++i) { // 8x8 RGBA8: 4 tiles of AR then GB
+    for (u32 t = 0; t < 16; ++t) {
+      u8* tile = sGuest.data() + i * 64;
+      tile[t * 2] = 255;
+      tile[t * 2 + 1] = Blue.r;
+      tile[32 + t * 2] = Blue.g;
+      tile[32 + t * 2 + 1] = Blue.b;
+    }
+  }
+  v = peek_after(
+      [] {
+        bp(0x66001000); // GXInvalidateTexAll
+        setup_2d(true);
+        guest_texture(GuestBase, 8, 8, GX_TF_RGBA8);
+        quad(96, 96, 104, 104);
+      },
+      AURORA_READBACK_PEEK_ARGB, at);
+  EXPECT_EQ(v[0] & 0xFFFFFF, argb(Blue) & 0xFFFFFF);
+}
+
+TEST_F(GuestCopyGpuTest, DisplayCopyWithoutClearKeepsTheEfb) {
+  constexpr GXColor A{10, 200, 30, 255}, B{90, 20, 160, 255};
+  const std::vector<std::pair<u16, u16>> at{{320, 240}};
+  run_frame([] { GXSetCopyClear(A, 0xFFFFFF); });
+  // A frame that starts cleared to A and ends with a display copy without clear; the next frame keeps it
+  auto v = peek_after([] { GXSetCopyClear(B, 0xFFFFFF); display_copy(false); }, AURORA_READBACK_PEEK_ARGB, at);
+  EXPECT_EQ(v[0] & 0xFFFFFF, argb(A) & 0xFFFFFF);
+  v = peek_after([] { display_copy(true); }, AURORA_READBACK_PEEK_ARGB, at);
+  EXPECT_EQ(v[0] & 0xFFFFFF, argb(A) & 0xFFFFFF); // still A: this frame was not cleared either
+  v = peek_after([] {}, AURORA_READBACK_PEEK_ARGB, at);
+  EXPECT_EQ(v[0] & 0xFFFFFF, argb(B) & 0xFFFFFF); // the clearing display copy: the next frame starts at B
+}
+
+TEST_F(GuestCopyGpuTest, ZTextureReplacesAndAddsDepth) {
+  // An 8x8 I8 texture of 0x40, read as an 8-bit Z texel, plus a bias
+  std::fill_n(sGuest.begin() + 0x1000, 64, u8{0x40});
+  const std::vector<std::pair<u16, u16>> at{{20, 20}, {60, 20}};
+  const auto v = peek_after(
+      [] {
+        GXSetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+        setup_2d(true);
+        guest_texture(GuestBase + 0x1000, 8, 8, GX_TF_I8);
+        GXSetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+        GXSetZTexture(GX_ZT_REPLACE, GX_TF_Z8, 0x123400);
+        quad(16, 16, 24, 24);
+        GXSetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
+        quad(56, 16, 64, 24);
+      },
+      AURORA_READBACK_PEEK_Z, at);
+  EXPECT_NEAR(static_cast<double>(v[0]), 0x123440, 1.0);
+  EXPECT_GT(std::abs(static_cast<double>(v[1]) - 0x123440), 1000.0); // the quad's own depth
+  // ADD: the quad's depth plus texel and bias
+  const auto w = peek_after(
+      [] {
+        setup_2d(true);
+        guest_texture(GuestBase + 0x1000, 8, 8, GX_TF_I8);
+        GXSetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+        GXSetZTexture(GX_ZT_ADD, GX_TF_Z8, 0x100);
+        quad(56, 16, 64, 24);
+        GXSetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
+      },
+      AURORA_READBACK_PEEK_Z, {{60, 20}});
+  EXPECT_NEAR(static_cast<double>(w[0]), static_cast<double>(v[1]) + 0x140, 2.0);
+}
+
+TEST_F(GuestCopyGpuTest, LogicOpsMatchBitwiseOpsOnBinaryChannels) {
+  // Per channel (R, G, B): src/dst = 1/1, 0/1, 1/0 in the first case and 0/0, 1/1, 0/1 in the second
+  struct Case {
+    GXColor src, dst;
+  };
+  constexpr Case Cases[] = {{{255, 0, 255, 255}, {255, 255, 0, 255}}, {{0, 255, 0, 255}, {0, 255, 255, 255}}};
+  const auto op_value = [](GXLogicOp op, u8 s, u8 d) -> u8 {
+    switch (op) {
+    case GX_LO_CLEAR: return 0;
+    case GX_LO_AND: return s & d;
+    case GX_LO_REVAND: return s & ~d;
+    case GX_LO_COPY: return s;
+    case GX_LO_INVAND: return ~s & d;
+    case GX_LO_NOOP: return d;
+    case GX_LO_XOR: return s ^ d;
+    case GX_LO_OR: return s | d;
+    case GX_LO_NOR: return ~(s | d);
+    case GX_LO_EQUIV: return ~(s ^ d);
+    case GX_LO_INV: return ~d;
+    case GX_LO_REVOR: return s | ~d;
+    case GX_LO_INVCOPY: return ~s;
+    case GX_LO_INVOR: return ~s | d;
+    case GX_LO_NAND: return ~(s & d);
+    case GX_LO_SET: return 0xFF;
+    }
+    return 0;
+  };
+  for (u32 o = 0; o < 16; ++o) {
+    const auto op = static_cast<GXLogicOp>(o);
+    if (op == GX_LO_REVOR || op == GX_LO_NAND) {
+      continue; // no blend equivalent (drawn as COPY and INVCOPY)
+    }
+    for (const auto& c : Cases) {
+      const auto v = peek_after(
+          [&] {
+            GXSetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+            fill(200, 200, 16, 16, c.dst);
+            setup_2d(false);
+            GXSetTevColor(GX_TEVREG0, c.src);
+            GXSetBlendMode(GX_BM_LOGIC, GX_BL_ONE, GX_BL_ZERO, op);
+            quad(200, 200, 216, 216);
+          },
+          AURORA_READBACK_PEEK_ARGB, {{208, 208}});
+      const u32 want = u32{op_value(op, c.src.r, c.dst.r)} << 16 | u32{op_value(op, c.src.g, c.dst.g)} << 8 |
+                       op_value(op, c.src.b, c.dst.b);
+      EXPECT_EQ(v[0] & 0xFFFFFF, want) << "logic op " << o;
+    }
+  }
+  // OR onto zero keeps any value (the depth-of-field fog pass)
+  const auto v = peek_after(
+      [] {
+        fill(200, 200, 16, 16, {0, 0, 0, 255});
+        setup_2d(false);
+        GXSetTevColor(GX_TEVREG0, {0x00, 0x12, 0x3F, 0xFF});
+        GXSetBlendMode(GX_BM_LOGIC, GX_BL_ONE, GX_BL_ONE, GX_LO_OR);
+        quad(200, 200, 216, 216);
+      },
+      AURORA_READBACK_PEEK_ARGB, {{208, 208}});
+  EXPECT_EQ(v[0] & 0xFFFFFF, 0x00123Fu);
+}
+
+TEST_F(GuestCopyGpuTest, AlphaOnlyClearingCopyThenDraw) {
+  // A copy that clears only the alpha (colour update off), then a draw: both take effect
+  constexpr GXColor Red{255, 0, 0, 200}, Blue{0, 0, 255, 255};
+  const auto v = peek_after(
+      [] {
+        GXSetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+        GXPokeAlphaRead(GX_READ_NONE);
+        fill(0, 0, 64, 64, Red);
+        GXSetColorUpdate(GX_FALSE);
+        GXSetAlphaUpdate(GX_TRUE);
+        GXSetCopyClear({0, 0, 0, 0}, 0xFFFFFF);
+        guest_copy(0, 0, 64, 64, GuestBase, false, true, 7);
+        setup_2d(false);
+        GXSetTevColor(GX_TEVREG0, Blue);
+        quad(16, 16, 32, 32);
+      },
+      AURORA_READBACK_PEEK_ARGB, {{20, 20}, {40, 40}});
+  EXPECT_EQ(v[0] & 0xFFFFFF, 0x0000FFu);
+  EXPECT_EQ(v[1] & 0xFFFFFF, 0xFF0000u); // the colour is kept
+  EXPECT_EQ(v[1] >> 24, 0u);             // the alpha cleared
+}

@@ -7,6 +7,7 @@
 #include "gx_test_common.hpp"
 #include "__gx.h"
 #include "gx/regs.hpp"
+#include "gx_test_resolve.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -4101,4 +4102,119 @@ TEST_F(GXResolverTest, IndexedNormalMatrixLoadReadsGuestArray) {
       EXPECT_EQ(flat[row * 4 + col], 10.0f + static_cast<float>(row * 3 + col));
     }
   }
+}
+
+// ============================================================================
+// EFB copies in raw streams (BP 0x49-0x54), Z textures (BP 0xF4/0xF5)
+// ============================================================================
+
+namespace {
+void put_bp(std::vector<u8>& out, u32 value) {
+  out.push_back(GX_LOAD_BP_REG);
+  put_be32(out, value);
+}
+
+std::vector<u8> copy_regs(u32 left, u32 top, u32 width, u32 height, u32 address, u32 trigger) {
+  std::vector<u8> bytes;
+  put_bp(bytes, 0x49000000 | left | top << 10);
+  put_bp(bytes, 0x4A000000 | (width - 1) | (height - 1) << 10);
+  put_bp(bytes, 0x4B000000 | address >> 5);
+  put_bp(bytes, 0x52000000 | trigger);
+  return bytes;
+}
+} // namespace
+
+TEST_F(GXResolverTest, GuestCopyDecodesSourceFormatAndHalfSize) {
+  std::vector<u8> bytes;
+  put_bp(bytes, 0x43000001); // RGBA6_Z24
+  // GXCopyTex: CTF_A8 (7), box-filtered half size, clear, clamped
+  const auto copy = copy_regs(16, 8, 64, 32, kGuestBase + 0x1000, 3 | 7 << 4 | 1 << 9 | 1 << 11 | 2 << 15);
+  bytes.insert(bytes.end(), copy.begin(), copy.end());
+  const auto before = aurora::gfx::testing::resolvePassCount.load();
+  decode_fifo(bytes);
+
+  EXPECT_EQ(aurora::gfx::testing::resolvePassCount.load(), before + 1);
+  const auto& r = aurora::gfx::testing::lastResolve;
+  EXPECT_EQ(r.rect.x, 16);
+  EXPECT_EQ(r.rect.y, 8);
+  EXPECT_EQ(r.rect.width, 64);
+  EXPECT_EQ(r.rect.height, 32);
+  EXPECT_EQ(r.format, GX_CTF_A8);
+  EXPECT_EQ(r.sourceFormat, GX_PF_RGBA6_Z24);
+  EXPECT_FALSE(r.filter.enabled);
+  const auto it = g_gxState.copyTextures.find(sGuestMemory.data() + 0x1000);
+  ASSERT_NE(it, g_gxState.copyTextures.end());
+  EXPECT_EQ(it->second.width, 32u);
+  EXPECT_EQ(it->second.height, 16u);
+}
+
+TEST_F(GXResolverTest, GuestDepthAndIntensityCopyFormats) {
+  std::vector<u8> bytes;
+  put_bp(bytes, 0x43000001); // RGBA6_Z24
+  put_bp(bytes, 0x43000003); // the SDK switches the PE to Z24 around a depth copy
+  auto copy = copy_regs(0, 0, 8, 8, kGuestBase, 3 | 6 << 4 | 2 << 15); // Z24X8
+  bytes.insert(bytes.end(), copy.begin(), copy.end());
+  decode_fifo(bytes);
+  EXPECT_EQ(aurora::gfx::testing::lastResolve.format, GX_TF_Z24X8);
+  EXPECT_EQ(aurora::gfx::testing::lastResolve.sourceFormat, GX_PF_RGBA6_Z24);
+
+  bytes.clear();
+  put_bp(bytes, 0x43000001);
+  copy = copy_regs(0, 0, 8, 8, kGuestBase, 3 | 1 << 4 | 3 << 15); // intensity: I8
+  bytes.insert(bytes.end(), copy.begin(), copy.end());
+  decode_fifo(bytes);
+  EXPECT_EQ(aurora::gfx::testing::lastResolve.format, GX_TF_I8);
+
+  bytes.clear();
+  copy = copy_regs(0, 0, 8, 8, kGuestBase, 3 | 1 << 3 | 0 << 4 | 2 << 15); // 8: CTF_R8
+  bytes.insert(bytes.end(), copy.begin(), copy.end());
+  decode_fifo(bytes);
+  EXPECT_EQ(aurora::gfx::testing::lastResolve.format, GX_CTF_R8);
+}
+
+TEST_F(GXResolverTest, DisplayCopyWithoutClearKeepsTheEfb) {
+  const auto before = aurora::gfx::testing::keepEfbCount.load();
+  decode_fifo(copy_regs(0, 0, 640, 480, kGuestBase, 3 | 1 << 14));
+  EXPECT_EQ(aurora::gfx::testing::keepEfbCount.load(), before + 1);
+  decode_fifo(copy_regs(0, 0, 640, 480, kGuestBase, 3 | 1 << 11 | 1 << 14));
+  EXPECT_EQ(aurora::gfx::testing::keepEfbCount.load(), before + 1);
+}
+
+TEST_F(GXResolverTest, CopyFilterCoefficientsAndClamp) {
+  std::vector<u8> bytes;
+  // GXSetCopyFilter with a 7-tap blur (8, 8, 10, 12, 10, 8, 8)
+  put_bp(bytes, 0x53000000 | 8 | 8 << 6 | 10 << 12 | 12 << 18);
+  put_bp(bytes, 0x54000000 | 10 | 8 << 6 | 8 << 12);
+  const auto copy = copy_regs(0, 0, 8, 8, kGuestBase, 1 | 6 << 4 | 2 << 15); // clamp top only
+  bytes.insert(bytes.end(), copy.begin(), copy.end());
+  decode_fifo(bytes);
+  const auto& f = aurora::gfx::testing::lastResolve.filter;
+  EXPECT_TRUE(f.enabled);
+  EXPECT_FLOAT_EQ(f.weights[0], 16.f / 64.f);
+  EXPECT_FLOAT_EQ(f.weights[1], 32.f / 64.f);
+  EXPECT_FLOAT_EQ(f.weights[2], 16.f / 64.f);
+  EXPECT_TRUE(f.clampTop);
+  EXPECT_FALSE(f.clampBottom);
+
+  bytes.clear();
+  put_bp(bytes, 0x53000000 | 21 << 12 | 22 << 18); // the SDK's "no filter": 0, 0, 21, 22, 21, 0, 0
+  put_bp(bytes, 0x54000000 | 21);
+  decode_fifo(bytes);
+  EXPECT_FALSE(g_gxState.copyVFilterEnabled);
+}
+
+TEST_F(GXFifoTest, ZTexture_DecodesBiasTypeAndOp) {
+  GXSetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0x123456);
+  auto bytes = capture_fifo();
+  EXPECT_TRUE(has_bp_write(bytes, 0xF4));
+  EXPECT_TRUE(has_bp_write(bytes, 0xF5));
+  reset_gx_state();
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.zTexOp, GX_ZT_REPLACE);
+  EXPECT_EQ(g_gxState.zTexType, 2);
+  EXPECT_EQ(g_gxState.zTexBias, 0x123456u);
+  GXSetZTexture(GX_ZT_ADD, GX_TF_Z16, 0);
+  decode_fifo(capture_fifo());
+  EXPECT_EQ(g_gxState.zTexOp, GX_ZT_ADD);
+  EXPECT_EQ(g_gxState.zTexType, 1);
 }
