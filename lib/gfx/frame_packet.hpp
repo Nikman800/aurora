@@ -96,6 +96,7 @@ struct RenderPass {
   GXPixelFmt resolveSourceFormat = GX_PF_RGBA6_Z24;
   ClipRect resolveRect;
   Range resolveUniformRange;
+  bool resolveFiltered = false; // copy vertical filter: always through a conversion shader
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
   wgpu::Texture snapshotNormalDst;

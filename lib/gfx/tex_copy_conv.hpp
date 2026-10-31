@@ -17,9 +17,16 @@ struct alignas(16) Uniforms {
   Vec2<float> offset;
   Vec2<float> scale{1.f, 1.f};
   uint32_t opaqueAlpha = 0;
-  std::array<uint32_t, 3> _pad{};
+  // Copy vertical filter: the rows above and below (rowStep apart in UV) and the row itself,
+  // weighted by vfWeights.xyz (sum 1 for the identity filter); UV y is clamped to clampY.
+  uint32_t vfEnable = 0;
+  float rowStep = 0.f;
+  uint32_t _pad0 = 0;
+  std::array<float, 4> vfWeights{0.f, 1.f, 0.f, 0.f};
+  Vec2<float> clampY{0.f, 1.f};
+  std::array<uint32_t, 2> _pad1{};
 };
-static_assert(sizeof(Uniforms) == 32);
+static_assert(sizeof(Uniforms) == 64);
 
 struct ConvRequest {
   GXTexFmt fmt;

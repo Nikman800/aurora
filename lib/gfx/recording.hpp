@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include "../imgui.hpp"
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -112,10 +113,26 @@ DrawData* get_last_draw_command();
 template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
 
+// Vertical filter of an EFB copy: weights of the row above, the row and the row below (the
+// hardware's seven coefficients summed per row, over 64), and whether the sampled rows are
+// clamped to the top and bottom of the source rectangle.
+struct CopyFilter {
+  bool enabled = false;
+  std::array<float, 3> weights{0.f, 1.f, 0.f};
+  bool clampTop = true;
+  bool clampBottom = true;
+};
+
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
-                       GXPixelFmt sourceFormat);
+                       GXPixelFmt sourceFormat, const CopyFilter& filter = {});
 uint32_t align_uniform(uint32_t value);
+// The next frame starts with this frame's EFB contents (a display copy that did not clear it).
+void keep_efb_next_frame() noexcept;
+// Waits until everything recorded so far is submitted to the GPU; then readback buffers complete
+// as poll_gpu_events processes the device's events.
+void finish_gpu_work() noexcept;
+void poll_gpu_events() noexcept;
 Vec2<uint32_t> get_render_target_size() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;
 void set_scissor(const ClipRect& scissor) noexcept;

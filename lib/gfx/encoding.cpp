@@ -271,7 +271,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         passInfo.resolveTarget->format == passInfo.colorAttachments[SceneColorAttachmentIndex].format;
     if (needsConversion) {
       tex_copy_conv::run(cmd, convReq);
-    } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
+    } else if (needsScaling || needsOpaqueAlpha || !sameFormat || passInfo.resolveFiltered) {
       tex_copy_conv::blit(cmd, convReq);
     } else {
       const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};

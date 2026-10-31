@@ -29,6 +29,10 @@ struct Uniforms {
     offset: vec2f,
     scale: vec2f,
     opaqueAlpha: u32,
+    vfEnable: u32,
+    rowStep: f32,
+    vfWeights: vec4f,
+    clampY: vec2f,
 };
 @group(0) @binding(2) var<uniform> ubuf: Uniforms;
 
@@ -55,9 +59,21 @@ var<private> uvs: array<vec2f, 3> = array(
     return out;
 }
 
-fn sample_efb(uv: vec2f) -> vec4f {
-    let c = textureSample(src, src_samp, uv);
+fn sample_efb_row(uv: vec2f) -> vec4f {
+    let c = textureSampleLevel(src, src_samp, uv, 0.0);
     return vec4f(c.rgb, select(c.a, 1.0, ubuf.opaqueAlpha != 0u));
+}
+
+fn sample_efb(uv: vec2f) -> vec4f {
+    if (ubuf.vfEnable == 0u) {
+        return sample_efb_row(uv);
+    }
+    // Copy vertical filter: the row above, the row itself and the row below
+    let up = vec2f(uv.x, clamp(uv.y - ubuf.rowStep, ubuf.clampY.x, ubuf.clampY.y));
+    let down = vec2f(uv.x, clamp(uv.y + ubuf.rowStep, ubuf.clampY.x, ubuf.clampY.y));
+    let c = sample_efb_row(up) * ubuf.vfWeights.x + sample_efb_row(uv) * ubuf.vfWeights.y +
+            sample_efb_row(down) * ubuf.vfWeights.z;
+    return min(c, vec4f(1.0));
 }
 
 fn intensity(rgb: vec3f) -> f32 {

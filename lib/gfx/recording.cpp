@@ -21,6 +21,7 @@
 #include "../window.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <new>
 #include <optional>
@@ -635,6 +636,8 @@ void prepare_recording() {
   }
 }
 
+std::atomic_bool g_keepEfb{false};
+
 void begin_recording(FramePacket& packet, size_t frameSlot) {
   CHECK(!g_recorder.active(), "A recording session is already active");
   if (!packet.efb.layout.colorAttachmentCount) {
@@ -655,6 +658,13 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   set_efb_targets(pass);
   pass.colorAttachments[SceneColorAttachmentIndex].clearValue = gx::g_gxState.clearColor;
   pass.clearDepthValue = gx::clear_depth_value();
+  if (g_keepEfb.exchange(false)) {
+    // The last frame's display copy did not clear the EFB
+    for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+      pass.colorAttachments[i].clear = false;
+    }
+    pass.clearDepth = false;
+  }
   g_recorder.currentRenderPass = 0;
   g_recorder.cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
   g_recorder.cachedScissor = gx::map_logical_scissor(gx::g_gxState.logicalScissor);
@@ -942,9 +952,15 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
   return find_pipeline(config, get_render_target_layout(), gx::g_gxState.drawsBlocking);
 }
 
+void keep_efb_next_frame() noexcept { detail::g_keepEfb.store(true); }
+
+void finish_gpu_work() noexcept { render_worker::synchronize(); }
+
+void poll_gpu_events() noexcept { webgpu::g_instance.ProcessEvents(); }
+
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
-                       GXPixelFmt sourceFormat) {
+                       GXPixelFmt sourceFormat, const CopyFilter& filter) {
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   prevPass.resolveTarget = std::move(texture);
@@ -953,11 +969,22 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   prevPass.resolveSourceFormat = sourceFormat;
   const auto srcW = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.width);
   const auto srcH = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.height);
-  const tex_copy_conv::Uniforms uniforms{
+  tex_copy_conv::Uniforms uniforms{
       .offset = {static_cast<float>(rect.x) / srcW, static_cast<float>(rect.y) / srcH},
       .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
       .opaqueAlpha = !gx::efb_has_alpha(sourceFormat),
   };
+  prevPass.resolveFiltered = false;
+  if (filter.enabled) {
+    // One destination row apart: two source rows for a half-size (box filtered) copy
+    const auto dstH = static_cast<float>(prevPass.resolveTarget->size.height);
+    uniforms.vfEnable = 1;
+    uniforms.rowStep = static_cast<float>(rect.height) / srcH / std::max(dstH, 1.f);
+    uniforms.vfWeights = {filter.weights[0], filter.weights[1], filter.weights[2], 0.f};
+    uniforms.clampY = {filter.clampTop ? (static_cast<float>(rect.y) + 0.5f) / srcH : 0.f,
+                       filter.clampBottom ? (static_cast<float>(rect.y + rect.height) - 0.5f) / srcH : 1.f};
+    prevPass.resolveFiltered = true;
+  }
   prevPass.resolveUniformRange = push_uniform(uniforms);
   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
 
@@ -1235,6 +1262,10 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
 
 bool readback::capture_color(StreamHandle stream, uint64_t key, uint32_t* widthOut, uint32_t* heightOut) {
   gx::fifo::drain();
+  return capture_color_now(stream, key, widthOut, heightOut);
+}
+
+bool readback::capture_color_now(StreamHandle stream, uint64_t key, uint32_t* widthOut, uint32_t* heightOut) {
   if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX || !valid_stream(stream)) {
     return false;
   }

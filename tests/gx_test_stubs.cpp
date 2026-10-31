@@ -16,6 +16,7 @@
 #include "gx/shader_info.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
+#include "gx_test_resolve.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -228,13 +229,27 @@ std::atomic<uint32_t> endOffscreenCount{0};
 std::atomic<uint32_t> resolvePassCount{0};
 std::atomic<uint32_t> offscreenWidth{0};
 std::atomic<uint32_t> offscreenHeight{0};
+std::atomic<uint32_t> keepEfbCount{0};
+LastResolve lastResolve;
 } // namespace testing
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
-                       GXPixelFmt sourceFormat) {
+                       GXPixelFmt sourceFormat, const CopyFilter& filter) {
+  testing::lastResolve = {
+      .rect = rect,
+      .clearColor = clearColor,
+      .clearAlpha = clearAlpha,
+      .clearDepth = clearDepth,
+      .format = resolveFormat,
+      .sourceFormat = sourceFormat,
+      .filter = filter,
+  };
   testing::resolvePassCount.fetch_add(1, std::memory_order_release);
 }
+void finish_gpu_work() noexcept {}
+void poll_gpu_events() noexcept {}
+void keep_efb_next_frame() noexcept { testing::keepEfbCount.fetch_add(1, std::memory_order_release); }
 void begin_offscreen(uint32_t width, uint32_t height) {
   testing::offscreenWidth.store(width, std::memory_order_relaxed);
   testing::offscreenHeight.store(height, std::memory_order_relaxed);
@@ -269,6 +284,7 @@ bool push_readback_op(std::shared_ptr<readback::Job> job, bool efbSource) {
 
 namespace aurora::gfx::readback {
 bool capture_color(StreamHandle, uint64_t, uint32_t*, uint32_t*) { return false; }
+bool capture_color_now(StreamHandle, uint64_t, uint32_t*, uint32_t*) { return false; }
 } // namespace aurora::gfx::readback
 
 namespace aurora::gfx::readback::gpu {
