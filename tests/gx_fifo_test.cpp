@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <thread>
 
 using aurora::gx::g_gxState;
@@ -4053,4 +4054,51 @@ TEST_F(GXResolverTest, ScissorBoxOffsetUsesHardwareEncoding) {
     }
   }
   EXPECT_EQ(value, (171u << 10) | 171u);
+}
+
+namespace {
+void put_guest_f32s(u32 offset, u32 count, float first) {
+  for (u32 i = 0; i < count; i++) {
+    const float f = first + static_cast<float>(i);
+    u32 bits;
+    std::memcpy(&bits, &f, sizeof bits);
+    for (u32 b = 0; b < 4; b++) {
+      sGuestMemory[offset + 4 * i + b] = static_cast<u8>(bits >> (24 - 8 * b));
+    }
+  }
+}
+} // namespace
+
+TEST_F(GXResolverTest, IndexedPositionMatrixLoadReadsGuestArray) {
+  put_guest_f32s(0x800, 24, 1.0f); // two 3x4 matrices, big-endian
+  std::vector<u8> bytes{GX_LOAD_CP_REG, 0xAC};
+  put_be32(bytes, kGuestBase + 0x800);
+  bytes.insert(bytes.end(), {GX_LOAD_CP_REG, 0xBC});
+  put_be32(bytes, 48);
+  // GXLoadPosMtxIndx(1, GX_PNMTX1): 12 words to XF 0x0C
+  bytes.insert(bytes.end(), {GX_LOAD_INDX_A, 0x00, 0x01, 0xB0, 0x0C});
+  decode_fifo(bytes);
+
+  const auto* flat = reinterpret_cast<const float*>(&g_gxState.pnMtx[1].pos);
+  for (int i = 0; i < 12; i++) {
+    EXPECT_EQ(flat[i], 13.0f + static_cast<float>(i));
+  }
+}
+
+TEST_F(GXResolverTest, IndexedNormalMatrixLoadReadsGuestArray) {
+  put_guest_f32s(0x900, 18, 1.0f); // two 3x3 matrices, big-endian
+  std::vector<u8> bytes{GX_LOAD_CP_REG, 0xAD};
+  put_be32(bytes, kGuestBase + 0x900);
+  bytes.insert(bytes.end(), {GX_LOAD_CP_REG, 0xBD});
+  put_be32(bytes, 36);
+  // GXLoadNrmMtxIndx3x3(1, GX_PNMTX1): 9 words to XF 0x409
+  bytes.insert(bytes.end(), {GX_LOAD_INDX_B, 0x00, 0x01, 0x84, 0x09});
+  decode_fifo(bytes);
+
+  const auto* flat = reinterpret_cast<const float*>(&g_gxState.pnMtx[1].nrm);
+  for (int row = 0; row < 3; row++) {
+    for (int col = 0; col < 3; col++) {
+      EXPECT_EQ(flat[row * 4 + col], 10.0f + static_cast<float>(row * 3 + col));
+    }
+  }
 }
