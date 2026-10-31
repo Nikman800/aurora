@@ -104,6 +104,25 @@ wgpu::CompareFunction to_compare_function(GXCompare func) {
   }
 }
 
+} // namespace
+
+u8 logic_op_source(GXLogicOp op) noexcept {
+  switch (op) {
+  case GX_LO_NOR:
+  case GX_LO_EQUIV:
+  case GX_LO_INVCOPY:
+  case GX_LO_INVOR:
+  case GX_LO_NAND:
+    return 1;
+  case GX_LO_INV:
+  case GX_LO_SET:
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+namespace {
 wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac, GXLogicOp op,
                                 u32 dstAlpha, bool dualSource) {
   wgpu::BlendComponent colorBlendComponent;
@@ -130,32 +149,53 @@ wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendF
         .dstFactor = wgpu::BlendFactor::One,
     };
     break;
-  case GX_BM_LOGIC:
+  case GX_BM_LOGIC: {
+    // There are no logic ops in WebGPU. Each op is the blend that gives the same result for
+    // channel values 0 and 255 (and for OR, also whenever one side is 0), some with the shader
+    // writing 1 - colour or 1 (logic_op_source); REVOR and NAND have none and are drawn as COPY
+    // and INVCOPY.
+    using F = wgpu::BlendFactor;
+    const auto add = [](F src, F dst) {
+      return wgpu::BlendComponent{.operation = wgpu::BlendOperation::Add, .srcFactor = src, .dstFactor = dst};
+    };
     switch (op) {
-      DEFAULT_FATAL("unsupported logic op {}", underlying(op));
     case GX_LO_CLEAR:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
+      colorBlendComponent = add(F::Zero, F::Zero);
+      break;
+    case GX_LO_AND:
+      colorBlendComponent = {.operation = wgpu::BlendOperation::Min, .srcFactor = F::One, .dstFactor = F::One};
+      break;
+    case GX_LO_REVAND: // s & ~d
+    case GX_LO_NOR:    // ~s & ~d (source 1 - s)
+    case GX_LO_INV:    // ~d (source 1)
+      colorBlendComponent = add(F::OneMinusDst, F::Zero);
       break;
     case GX_LO_COPY:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::One,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
+    case GX_LO_REVOR:   // approximated
+    case GX_LO_INVCOPY: // source 1 - s
+    case GX_LO_NAND:    // approximated (source 1 - s)
+    case GX_LO_SET:     // source 1
+      colorBlendComponent = add(F::One, F::Zero);
+      break;
+    case GX_LO_INVAND: // ~s & d
+      colorBlendComponent = add(F::Zero, F::OneMinusSrc);
       break;
     case GX_LO_NOOP:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::One,
-      };
+      colorBlendComponent = add(F::Zero, F::One);
+      break;
+    case GX_LO_XOR:   // s ^ d
+    case GX_LO_EQUIV: // ~(s ^ d) (source 1 - s)
+      colorBlendComponent = add(F::OneMinusDst, F::OneMinusSrc);
+      break;
+    case GX_LO_OR: // s | d
+      colorBlendComponent = add(F::OneMinusDst, F::One);
+      break;
+    case GX_LO_INVOR: // ~s | d (source 1 - s)
+      colorBlendComponent = add(F::One, F::OneMinusSrc);
       break;
     }
     break;
+  }
   }
   if (dualSource) {
     const auto remap = [](wgpu::BlendFactor factor) {
@@ -458,6 +498,14 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
+  }
+  if (g_gxState.zTexOp == GX_ZT_ADD || g_gxState.zTexOp == GX_ZT_REPLACE) {
+    config.shaderConfig.zTexOp = g_gxState.zTexOp;
+    config.shaderConfig.zTexType = g_gxState.zTexType;
+    config.shaderConfig.zTexBias = g_gxState.zTexBias;
+  }
+  if (g_gxState.blendMode == GX_BM_LOGIC) {
+    config.shaderConfig.logicSrc = logic_op_source(g_gxState.blendOp);
   }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);

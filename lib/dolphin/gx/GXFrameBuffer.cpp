@@ -50,8 +50,14 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto clearColor = clear && g_gxState.colorUpdate;
   const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
   const auto clearDepth = clear && g_gxState.depthUpdate;
+  const gfx::CopyFilter filter{
+      .enabled = g_gxState.copyVFilterEnabled,
+      .weights = g_gxState.copyVFilterWeights,
+      .clampTop = g_gxState.copyClampTop,
+      .clampBottom = g_gxState.copyClampBottom,
+  };
   gfx::resolve_pass_into(copy.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
-                         clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
+                         clear_depth_value(), texCopyFmt, g_gxState.pixelFmt, filter);
 }
 } // namespace aurora::gx
 

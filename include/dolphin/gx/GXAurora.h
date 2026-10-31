@@ -198,6 +198,57 @@ typedef const void* (*AuroraAddressResolver)(u32 address, u32* size, void* userD
  */
 void AuroraSetAddressResolver(AuroraAddressResolver resolver, void* userData);
 
+/*
+ * EFB copies in raw command streams. While an address resolver is installed, the EFB copy
+ * registers (BP 0x49-0x4E, 0x52, the copy filter 0x53/0x54) are decoded as the hardware does:
+ * a texture copy is kept on the GPU, keyed by the resolved destination, and a later texture
+ * load from that address samples it. The copy stays authoritative for its address until another
+ * copy replaces it or the bytes in memory change (checked at each texture cache invalidation).
+ * A display copy without clear keeps the EFB contents for the next frame.
+ */
+
+/** A texture copy as the hardware would have written it to memory. */
+typedef struct {
+  u32 address;      /* 32-bit destination */
+  u32 format;       /* GXTexFmt of the copy (GX_CTF_* for the copy-only formats) */
+  u16 width;        /* copy size in texels */
+  u16 height;
+  u16 srcLeft;      /* EFB source rectangle */
+  u16 srcTop;
+  u16 srcWidth;
+  u16 srcHeight;
+  u8 half;          /* box-filtered half-size copy */
+  u8 clear;         /* the EFB was cleared after the copy */
+  u8 depth;         /* a Z copy */
+  u8 vfilter;       /* the vertical copy filter was on */
+  u32 pixelFormat;  /* GXPixelFmt of the EFB (its colour format for a Z copy) */
+  f32 vfilterWeights[3]; /* row above, row, row below (the seven coefficients summed, over 64) */
+  const void* data; /* tiled, big-endian, in `format` */
+  u32 size;
+  /* With source capture: the whole EFB colour just before the copy (RGBA8, top row first); NULL for
+     a Z copy or without source capture. */
+  const void* efb;
+  u32 efbWidth;
+  u32 efbHeight;
+} AuroraCopyWritebackInfo;
+
+typedef void (*AuroraCopyWriteback)(const AuroraCopyWritebackInfo* copy, void* userData);
+
+/**
+ * Installs (or, with NULL, removes) the copy writeback. While installed, every texture copy to a
+ * resolved address is also read back and encoded; AuroraFlushCopyWriteback delivers them. With
+ * `captureSources`, the EFB colour at each copy is read back too (for tests and debugging: it ends
+ * the render pass at every copy).
+ */
+void AuroraSetCopyWriteback(AuroraCopyWriteback writeback, void* userData, bool captureSources);
+
+/**
+ * Outside a frame (after aurora_end_frame): waits until the GPU has finished every texture copy
+ * recorded so far and passes each one to the writeback, in copy order. Returns the number
+ * delivered (copies whose readback failed are logged and skipped).
+ */
+u32 AuroraFlushCopyWriteback(void);
+
 /**
  * Sets the actual render viewport in native framebuffer coordinates.
  * Overrides the automatically scaled values set by the logical GXSetViewport.

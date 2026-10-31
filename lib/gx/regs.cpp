@@ -260,6 +260,9 @@ void bp_cmode1(u8, u32 value) noexcept {
 // PE control (0x43)
 void bp_pe_ctrl(u8, u32 value) noexcept {
   g_gxState.pixelFmt = decode_pixel_fmt(value, g_gxState.bpRegCache[0x42]);
+  if (g_gxState.pixelFmt != GX_PF_Z24) {
+    g_gxState.efbColorFmt = g_gxState.pixelFmt;
+  }
   g_gxState.zFmt = static_cast<GXZFmt16>(reg_get(value, 3, 3));
   g_gxState.zCompLocBeforeTex = reg_get(value, 1, 6) != 0;
 }
@@ -279,12 +282,40 @@ void bp_clear_depth(u8, u32 value) noexcept { g_gxState.clearDepth = reg_get(val
 
 // EFB copy trigger (0x52)
 void bp_efb_copy(u8, u32 value) noexcept {
+  if (has_address_resolver() && g_gxState.texCopyDest == nullptr) {
+    // Raw hardware stream: source, destination and filter from the copy registers (GXCopyTex of
+    // Aurora's own API sets a host destination first)
+    guest_efb_copy(value);
+    return;
+  }
   const bool clear = reg_get(value, 1, 11) != 0;
   if (reg_get(value, 1, 14) != 0) {
     Log.warn("STUB: display copy is not implemented");
   } else {
     copy_tex(g_gxState.texCopyDest, clear);
   }
+  g_gxState.texCopyDest = nullptr;
+}
+
+// Copy vertical filter coefficients (0x53/0x54): seven 6-bit weights (sum 64) for the row above
+// (two), the row itself (three) and the row below (two).
+void bp_copy_filter(u8, u32) noexcept {
+  const u32 c0 = g_gxState.bpRegCache[0x53];
+  const u32 c1 = g_gxState.bpRegCache[0x54];
+  const auto coef = [](u32 reg, u32 i) { return static_cast<int>((reg >> (6 * i)) & 0x3F); };
+  const int above = coef(c0, 0) + coef(c0, 1);
+  const int row = coef(c0, 2) + coef(c0, 3) + coef(c1, 0);
+  const int below = coef(c1, 1) + coef(c1, 2);
+  g_gxState.copyVFilterEnabled = !(above == 0 && below == 0 && row == 64);
+  g_gxState.copyVFilterWeights = {static_cast<float>(above) / 64.f, static_cast<float>(row) / 64.f,
+                                  static_cast<float>(below) / 64.f};
+}
+
+// Z texture (0xF4 bias, 0xF5 texel type and operation)
+void bp_ztex(u8, u32) noexcept {
+  g_gxState.zTexBias = g_gxState.bpRegCache[0xF4] & 0xFFFFFF;
+  g_gxState.zTexType = static_cast<u8>(g_gxState.bpRegCache[0xF5] & 3);
+  g_gxState.zTexOp = static_cast<u8>((g_gxState.bpRegCache[0xF5] >> 2) & 3);
 }
 
 // TLUT load trigger (0x65)
@@ -572,6 +603,14 @@ constexpr auto kBpRegs = [] {
   regs[0x50] = {bp_clear_bg};
   regs[0x51] = {bp_clear_depth};
   regs[0x52] = {bp_efb_copy, 0, /* alwaysHandle */ true};
+  // EFB copy source, size, destination, stride and display copy scale: read by the copy trigger
+  regs[0x49] = {};
+  regs[0x4A] = {};
+  regs[0x4B] = {};
+  regs[0x4D] = {};
+  regs[0x4E] = {};
+  regs[0x53] = {bp_copy_filter, 0, /* alwaysHandle */ true};
+  regs[0x54] = {bp_copy_filter, 0, /* alwaysHandle */ true};
   regs[0x59] = {bp_scissor};
   regs[0x64] = {}; // TLUT load address; bp_tlut_load reads from shadow
   regs[0x65] = {bp_tlut_load, DirtyTextures, /* alwaysHandle */ true};
@@ -598,6 +637,8 @@ constexpr auto kBpRegs = [] {
   for (u8 r = 0xE9; r <= 0xED; ++r) {
     regs[r] = {bp_fog_range_k, DirtyUniform};
   }
+  regs[0xF4] = {bp_ztex, DirtyPipeline};
+  regs[0xF5] = {bp_ztex, DirtyPipeline};
   regs[0xEE] = {bp_fog0, DirtyUniform};
   regs[0xEF] = {bp_fog1, DirtyUniform};
   regs[0xF0] = {bp_fog2, DirtyUniform};

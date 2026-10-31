@@ -353,10 +353,15 @@ struct GXState {
   GXBlendFactor blendFacSrc = GX_BL_SRCALPHA;
   GXBlendFactor blendFacDst = GX_BL_INVSRCALPHA;
   GXLogicOp blendOp = GX_LO_CLEAR;
+  // Z texture (BP 0xF4/0xF5)
+  u8 zTexOp = 0;
+  u8 zTexType = 2;
+  u32 zTexBias = 0;
   GXCompare depthFunc = GX_LEQUAL;
   Vec4<float> clearColor{0.f, 0.f, 0.f, 1.f};
   u32 clearDepth = 0xFFFFFF;
   GXPixelFmt pixelFmt = GX_PF_RGB8_Z24;
+  GXPixelFmt efbColorFmt = GX_PF_RGB8_Z24; // pixelFmt, except while the PE is in Z mode for a depth copy
   GXZFmt16 zFmt = GX_ZC_LINEAR;
   bool zCompLocBeforeTex = false;
   u32 dstAlpha; // u8; UINT32_MAX = disabled
@@ -414,6 +419,11 @@ struct GXState {
   u32 texCopyDstHeight = 0;
   bool texCopyDstWide = false;
   const void* texCopyDest = nullptr;
+  // Copy vertical filter (BP 0x53/0x54) and clamping (BP 0x52 bits 0/1)
+  bool copyVFilterEnabled = false;
+  std::array<float, 3> copyVFilterWeights{0.f, 1.f, 0.f};
+  bool copyClampTop = true;
+  bool copyClampBottom = true;
   absl::flat_hash_map<const void*, CopyTextureRef> copyTextures;
 
   // Cache state
@@ -457,6 +467,8 @@ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
+// Logic op blend equivalents: what the shader writes (0 = the colour, 1 = 1 - colour, 2 = 1)
+u8 logic_op_source(GXLogicOp op) noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
 
@@ -502,8 +514,11 @@ struct ShaderConfig {
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 fogRangeEnabled : 1 = false;
-  u8 pad1 : 5 = 0;
-  u8 pad2 = 0;
+  u8 zTexOp : 2 = 0;   // GXZTexOp: the last TEV stage's texel sets (or offsets) the depth
+  u8 zTexType : 2 = 0; // 0 = 8-bit, 1 = 16-bit, 2 = 24-bit Z texel
+  u8 pad1 : 1 = 0;
+  u8 logicSrc : 2 = 0; // blend-equivalent logic ops: 1 = output 1 - colour, 2 = output 1
+  u8 pad2 : 6 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
@@ -513,6 +528,7 @@ struct ShaderConfig {
   AlphaCompare alphaCompare;
   std::array<IndStage, MaxIndStages> indStages{};
   u32 numIndStages = 0;
+  u32 zTexBias = 0; // added to the Z texel (24-bit)
 
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };

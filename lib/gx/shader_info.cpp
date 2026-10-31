@@ -241,6 +241,14 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   // 10 position matrices, 10 texture matrices, 10 normal matrices.
   info.uniformSize += sizeof(Mat3x4<float>) * 30;
 
+  if (config.zTexOp != 0 && config.tevStageCount > 0) {
+    // Z texture: the last stage's texel, whether or not its TEV inputs use it
+    const auto& last = config.tevStages[config.tevStageCount - 1];
+    if (last.texMapId != GX_TEXMAP_NULL && last.texCoordId != GX_TEXCOORD_NULL) {
+      info.sampledTexCoords.set(last.texCoordId);
+      info.sampledTextures.set(last.texMapId);
+    }
+  }
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     // Color pass

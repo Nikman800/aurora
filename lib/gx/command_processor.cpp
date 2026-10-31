@@ -1,6 +1,8 @@
 #include "command_processor.hpp"
 
 #include "../gfx/hash.hpp"
+#include "../gfx/readback/copy_layout.hpp"
+#include "../gfx/readback/readback.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
@@ -16,7 +18,10 @@
 
 #include <algorithm>
 #include <bitset>
+#include <chrono>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <tuple>
 #include <cmath>
 #include <cstdint>
@@ -241,6 +246,107 @@ GuestObject& guest_object(const GuestKey& key, const u8* data, u32 size) noexcep
   return obj;
 }
 
+// Texture copies to resolved addresses: the bytes in memory when the copy was made (or written
+// back), so that a copy stops shadowing its address once the CPU writes something else there.
+struct GuestCopy {
+  const u8* data = nullptr;
+  u32 size = 0;
+  HashType hash = 0;
+  u32 checkedGeneration = 0;
+};
+std::mutex sGuestCopyMutex; // sGuestCopies and sPendingWritebacks: FIFO thread and flush
+std::map<u32, GuestCopy> sGuestCopies;
+struct PendingWriteback {
+  AuroraCopyWritebackInfo info{};
+  AuroraReadbackStream stream = 0;
+  u64 sequence = 0;
+  AuroraReadbackStream sourceStream = 0; // EFB colour before the copy (source capture)
+};
+std::vector<PendingWriteback> sPendingWritebacks;
+AuroraCopyWriteback sCopyWriteback = nullptr;
+void* sCopyWritebackUserData = nullptr;
+bool sCopyWritebackSources = false;
+
+// The newest packet of `stream` once it has `sequence` (null after a timeout: a failed capture).
+std::shared_ptr<const gfx::readback::Packet> wait_packet(AuroraReadbackStream stream, u64 sequence) noexcept {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (true) {
+    auto packet = gfx::readback::latest(stream);
+    if (packet && packet->sequence >= sequence) {
+      return packet;
+    }
+    if (std::chrono::steady_clock::now() > deadline) {
+      return nullptr;
+    }
+    gfx::poll_gpu_events();
+    std::this_thread::yield();
+  }
+}
+
+// The texture format of an EFB copy from BP 0x52 (and whether the EFB is in Z mode, PE control
+// format Z24, as the SDK sets it around a depth copy). GX_TF_I4 with ok = false: unsupported.
+GXTexFmt copy_texture_format(u32 copyReg, bool depth, bool& ok) noexcept {
+  const u32 fmt = ((copyReg >> 4) & 7) | (((copyReg >> 3) & 1) << 3);
+  ok = true;
+  if (depth) {
+    switch (fmt) {
+    case 0x0:
+      return GX_CTF_Z4;
+    case 0x1:
+      return GX_TF_Z8;
+    case 0x6:
+      return GX_TF_Z24X8;
+    case 0x9:
+      return GX_CTF_Z8M;
+    case 0xA:
+      return GX_CTF_Z8L;
+    case 0xB:
+      return GX_TF_Z16;
+    case 0xC:
+      return GX_CTF_Z16L;
+    default:
+      break;
+    }
+  } else if ((copyReg >> 15) & 1) {
+    // Intensity formats (converted through YUV)
+    switch (fmt) {
+    case 0x0:
+      return GX_TF_I4;
+    case 0x1:
+      return GX_TF_I8;
+    case 0x2:
+      return GX_TF_IA4;
+    case 0x3:
+      return GX_TF_IA8;
+    default:
+      break;
+    }
+  } else {
+    static constexpr GXTexFmt Color[13] = {GX_CTF_R4,    GX_CTF_R8,    GX_CTF_RA4, GX_CTF_RA8, GX_TF_RGB565,
+                                           GX_TF_RGB5A3, GX_TF_RGBA8,  GX_CTF_A8,  GX_CTF_R8,  GX_CTF_G8,
+                                           GX_CTF_B8,    GX_CTF_RG8,   GX_CTF_GB8};
+    if (fmt < 13) {
+      return Color[fmt];
+    }
+  }
+  ok = false;
+  return GX_TF_I4;
+}
+
+// A copy shadows `address` (texture loads from it sample the copy) until its bytes change.
+void check_guest_copy(u32 address, const u8* data) noexcept {
+  std::lock_guard lock{sGuestCopyMutex};
+  const auto it = sGuestCopies.find(address);
+  if (it == sGuestCopies.end() || it->second.data != data || it->second.checkedGeneration == sGuestGeneration) {
+    return;
+  }
+  it->second.checkedGeneration = sGuestGeneration;
+  if (xxh3_hash_s(data, it->second.size) != it->second.hash) {
+    evict_copy_texture(data);
+    sGuestCopies.erase(it);
+  }
+}
+
 u32 guest_tlut_slot(u32 tmem) noexcept {
   for (u32 i = 0; i < MaxTluts; ++i) {
     if (sGuestTlutTmem[i] == tmem + 1) {
@@ -270,6 +376,7 @@ void resolve_guest_texture(u32 texMapId) noexcept {
     slot.texObjId = 0;
     return;
   }
+  check_guest_copy(address, data);
   const auto& obj = guest_object({address, slot.image0 & 0xFFFFFF, levels}, data, size);
   slot.texObjId = obj.id;
   slot.texDataVersion = obj.version;
@@ -1026,6 +1133,162 @@ void load_guest_tlut(u32 loadTlut0, u32 loadTlut1) noexcept {
 void invalidate_guest_textures() noexcept {
   ++sGuestGeneration;
   sGuestTexPending |= sGuestTexMaps;
+}
+
+void guest_efb_copy(u32 copyReg) noexcept {
+  const u32 srcReg = g_gxState.bpRegCache[0x49];
+  const u32 sizeReg = g_gxState.bpRegCache[0x4A];
+  const s32 left = static_cast<s32>(srcReg & 0x3FF);
+  const s32 top = static_cast<s32>((srcReg >> 10) & 0x3FF);
+  const u32 width = (sizeReg & 0x3FF) + 1;
+  const u32 height = ((sizeReg >> 10) & 0x3FF) + 1;
+  const bool clear = ((copyReg >> 11) & 1) != 0;
+  if (((copyReg >> 14) & 1) != 0) {
+    // Display copy: there is no external frame buffer; the frame is presented from the EFB, which
+    // the next frame starts by clearing unless this copy did not clear it.
+    if (!clear) {
+      gfx::keep_efb_next_frame();
+    }
+    return;
+  }
+  const bool depth = (g_gxState.bpRegCache[0x43] & 7) == 3;
+  bool ok = false;
+  const GXTexFmt format = copy_texture_format(copyReg, depth, ok);
+  if (!ok) {
+    Log.error("Unsupported EFB copy format (BP 0x52 = 0x{:06X}, Z: {})", copyReg & 0xFFFFFF, depth);
+    return;
+  }
+  // Box-filtered half-size copy
+  const bool half = ((copyReg >> 9) & 1) != 0;
+  const u32 dstWidth = half ? std::max(width / 2, 1u) : width;
+  const u32 dstHeight = half ? std::max(height / 2, 1u) : height;
+  const u32 address = (g_gxState.bpRegCache[0x4B] & 0xFFFFFF) << 5;
+  const u32 size = gfx::readback::byte_size(format, dstWidth, dstHeight);
+  const u8* dest = resolve_address(address, size);
+  if (dest == nullptr) {
+    return;
+  }
+  g_gxState.texCopySrc = {left, top, static_cast<s32>(width), static_cast<s32>(height)};
+  g_gxState.texCopyDstWidth = dstWidth;
+  g_gxState.texCopyDstHeight = dstHeight;
+  g_gxState.texCopyFmt = format;
+  g_gxState.copyClampTop = (copyReg & 1) != 0;
+  g_gxState.copyClampBottom = (copyReg & 2) != 0;
+
+  std::lock_guard lock{sGuestCopyMutex};
+  const bool writeback = sCopyWriteback != nullptr && gfx::readback::supported();
+  if (sCopyWriteback != nullptr && !writeback) {
+    static bool warned = false;
+    if (!warned) {
+      Log.warn("Copy writeback: GPU readback is not supported here");
+      warned = true;
+    }
+  }
+  PendingWriteback pending{
+      .info =
+          {
+              .address = address,
+              .format = static_cast<u32>(format),
+              .width = static_cast<u16>(dstWidth),
+              .height = static_cast<u16>(dstHeight),
+              .srcLeft = static_cast<u16>(left),
+              .srcTop = static_cast<u16>(top),
+              .srcWidth = static_cast<u16>(width),
+              .srcHeight = static_cast<u16>(height),
+              .half = half,
+              .clear = clear,
+              .depth = depth,
+              .vfilter = g_gxState.copyVFilterEnabled,
+              .pixelFormat = static_cast<u32>(g_gxState.efbColorFmt),
+              .vfilterWeights = {g_gxState.copyVFilterWeights[0], g_gxState.copyVFilterWeights[1],
+                                 g_gxState.copyVFilterWeights[2]},
+              .size = size,
+          },
+  };
+  if (writeback && sCopyWritebackSources && !depth) {
+    pending.sourceStream = gfx::readback::create_stream(); // its first capture: any packet is it
+    if (!gfx::readback::capture_color_now(pending.sourceStream, address)) {
+      gfx::readback::destroy_stream(pending.sourceStream);
+      pending.sourceStream = 0;
+    }
+  }
+
+  // A depth copy reads the Z buffer of an EFB that is in its colour format otherwise
+  const GXPixelFmt pixelFmt = g_gxState.pixelFmt;
+  g_gxState.pixelFmt = g_gxState.efbColorFmt;
+  copy_tex(dest, clear);
+  g_gxState.pixelFmt = pixelFmt;
+
+  sGuestCopies[address] = {dest, size, xxh3_hash_s(dest, size), sGuestGeneration};
+  if (!writeback) {
+    return;
+  }
+  pending.stream = gfx::readback::create_stream();
+  pending.sequence = gfx::readback::next_sequence(pending.stream);
+  const std::pair<u64, const void*> source{address, dest};
+  if (readback::record_copy_capture(pending.stream, pending.sequence, std::span{&source, 1})) {
+    sPendingWritebacks.push_back(pending);
+  } else {
+    gfx::readback::destroy_stream(pending.stream);
+    if (pending.sourceStream != 0) {
+      gfx::readback::destroy_stream(pending.sourceStream);
+    }
+  }
+}
+
+void set_copy_writeback(AuroraCopyWriteback writeback, void* userData, bool captureSources) noexcept {
+  std::lock_guard lock{sGuestCopyMutex};
+  sCopyWriteback = writeback;
+  sCopyWritebackUserData = userData;
+  sCopyWritebackSources = captureSources;
+}
+
+u32 flush_copy_writeback() noexcept {
+  std::vector<PendingWriteback> pending;
+  AuroraCopyWriteback writeback;
+  void* userData;
+  {
+    std::lock_guard lock{sGuestCopyMutex};
+    pending.swap(sPendingWritebacks);
+    writeback = sCopyWriteback;
+    userData = sCopyWritebackUserData;
+  }
+  if (pending.empty()) {
+    return 0;
+  }
+  // Everything recorded so far is submitted; the readback buffers map asynchronously.
+  gfx::finish_gpu_work();
+  u32 delivered = 0;
+  for (auto& item : pending) {
+    const auto packet = wait_packet(item.stream, item.sequence);
+    const gfx::readback::Output* output = packet ? packet->find(item.info.address) : nullptr;
+    std::shared_ptr<const gfx::readback::Packet> source;
+    if (item.sourceStream != 0) {
+      source = wait_packet(item.sourceStream, 0);
+      if (const auto* sourceOutput = source ? source->find(item.info.address) : nullptr) {
+        item.info.efb = source->payload_of(*sourceOutput).data();
+        item.info.efbWidth = source->imageWidth;
+        item.info.efbHeight = source->imageHeight;
+      }
+      gfx::readback::destroy_stream(item.sourceStream);
+    }
+    if (output == nullptr || output->payloadSize != item.info.size) {
+      Log.error("Copy writeback of 0x{:08X} failed", item.info.address);
+    } else if (writeback != nullptr) {
+      const auto payload = packet->payload_of(*output);
+      item.info.data = payload.data();
+      writeback(&item.info, userData);
+      ++delivered;
+      // The memory now holds the copy: it stays authoritative until the CPU changes it.
+      std::lock_guard lock{sGuestCopyMutex};
+      if (const auto it = sGuestCopies.find(item.info.address);
+          it != sGuestCopies.end() && it->second.size == item.info.size) {
+        it->second.hash = xxh3_hash_s(payload.data(), payload.size());
+      }
+    }
+    gfx::readback::destroy_stream(item.stream);
+  }
+  return delivered;
 }
 
 void clear_draw_cache() noexcept {

@@ -1319,7 +1319,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     const bool hasIndirectStage = stage.indTexStage < config.numIndStages;
     const bool needsTevTexCoord =
         needsIndirectCoord || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF || stage.indTexAddPrev;
-    const bool needsTextureSample = uses_texture_sample(stage);
+    const bool zTexSample = config.zTexOp != 0 && i == static_cast<int>(config.tevStageCount) - 1 &&
+                            stage.texMapId != GX_TEXMAP_NULL && stage.texCoordId != GX_TEXCOORD_NULL;
+    const bool needsTextureSample = uses_texture_sample(stage) || zTexSample;
     if (!needsTevTexCoord && !needsTextureSample) {
       continue;
     }
@@ -1599,9 +1601,45 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev = vec4f(in.mv_nrm, prev.a);";
   }
 
+  if (config.logicSrc == 1) {
+    // Logic op blend equivalent (gx.cpp): the inverted colour
+    fragmentFn += "\n    prev = vec4f(1.0) - clamp(prev, vec4f(0.0), vec4f(1.0));";
+  } else if (config.logicSrc == 2) {
+    fragmentFn += "\n    prev = vec4f(1.0);";
+  }
   if (dstAlphaMode == DstAlphaMode::Replace) {
     // GX destination alpha is set via the blend constant
     fragmentFn += "\n    prev.a = 1.0;";
+  }
+  std::string zTexDepth;
+  if (config.zTexOp != 0 && config.tevStageCount > 0) {
+    // Z texture: the last stage's texel (8, 16 or 24 bits) plus the bias replaces the depth or is
+    // added to it
+    const auto last = config.tevStageCount - 1;
+    const auto& stage = config.tevStages[last];
+    if (stage.texMapId != GX_TEXMAP_NULL && stage.texCoordId != GX_TEXCOORD_NULL) {
+      fragmentFn += fmt::format("\n    let ztexel = vec4u(round(clamp(sampled{}, vec4f(0.0), vec4f(1.0)) * 255.0));", last);
+    } else {
+      fragmentFn += "\n    let ztexel = vec4u(0u);";
+    }
+    switch (config.zTexType) {
+    case 0:
+      fragmentFn += "\n    var ztex = ztexel.r;";
+      break;
+    case 1:
+      fragmentFn += "\n    var ztex = (ztexel.r << 8u) | ztexel.a;";
+      break;
+    default:
+      fragmentFn += "\n    var ztex = (ztexel.r << 16u) | (ztexel.g << 8u) | ztexel.b;";
+      break;
+    }
+    fragmentFn += fmt::format("\n    ztex = ztex + {}u;", config.zTexBias);
+    if (config.zTexOp == GX_ZT_ADD) {
+      fragmentFn += fmt::format("\n    ztex = ztex + u32(clamp({}, 0.0, 1.0) * 16777215.0 + 0.5);",
+                                UseReversedZ ? "1.0 - in.pos.z" : "in.pos.z");
+    }
+    fragmentFn += "\n    let zf = f32(min(ztex, 0xFFFFFFu)) / 16777215.0;";
+    zTexDepth = UseReversedZ ? "1.0 - zf" : "zf";
   }
 
   std::string fragmentOutput;
@@ -1635,6 +1673,23 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "};\n";
     fragmentOutputType = "FragmentOutput"sv;
     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
+    if (!zTexDepth.empty()) {
+      fragmentReturn = fmt::format("\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev, {});", zTexDepth);
+    }
+  }
+  if (!zTexDepth.empty()) {
+    if (fragmentOutput.empty()) {
+      fragmentOutput =
+          "\nstruct FragmentOutput {\n"
+          "    @location(0) color: vec4f,\n"
+          "};\n";
+      fragmentOutputType = "FragmentOutput"sv;
+      fragmentReturn = fmt::format("\n    return FragmentOutput(prev, {});", zTexDepth);
+    } else if (dstAlphaMode != DstAlphaMode::DualSource) {
+      // The normal attachment's output: set the depth before returning
+      fragmentReturn.insert(fragmentReturn.rfind("\n    return out;"), fmt::format("\n    out.depth = {};", zTexDepth));
+    }
+    fragmentOutput.insert(fragmentOutput.rfind("};"), "    @builtin(frag_depth) depth: f32,\n");
   }
 
   auto shaderSource =

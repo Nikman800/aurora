@@ -2,6 +2,8 @@
 
 #include "../internal.hpp"
 
+#include <dolphin/gx/GXAurora.h>
+
 #include <cstdint>
 
 namespace aurora::gx::fifo {
@@ -32,5 +34,11 @@ void load_guest_tlut(uint32_t loadTlut0, uint32_t loadTlut1) noexcept;
 void invalidate_guest_textures() noexcept;
 // Texture maps that came from GX_AURORA_LOAD_TEXOBJ are no longer resolved from BP registers.
 void forget_guest_texture(uint32_t texMapId) noexcept;
+
+// EFB copy trigger (BP 0x52) with the copy registers from the shadow state.
+void guest_efb_copy(uint32_t copyReg) noexcept;
+// Copy writeback (AuroraSetCopyWriteback / AuroraFlushCopyWriteback).
+void set_copy_writeback(AuroraCopyWriteback writeback, void* userData, bool captureSources) noexcept;
+uint32_t flush_copy_writeback() noexcept;
 
 } // namespace aurora::gx::fifo

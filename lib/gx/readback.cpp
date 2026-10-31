@@ -257,7 +257,11 @@ void handle_capture_copies(ByteReader& reader) {
     key = reader.read<u64>();
     source = reinterpret_cast<const void*>(reader.read<u64>());
   }
+  record_copy_capture(header.stream, header.sequence, sources);
+}
 
+bool record_copy_capture(StreamHandle stream, uint64_t sequence,
+                         std::span<const std::pair<uint64_t, const void*>> sources) {
   std::vector<Output> outputs;
   std::vector<std::pair<gfx::TextureHandle, CopyPackParams>> packs;
   outputs.reserve(sources.size());
@@ -267,14 +271,14 @@ void handle_capture_copies(ByteReader& reader) {
     const auto it = g_gxState.copyTextures.find(source);
     if (it == g_gxState.copyTextures.end() || !it->second) {
       fail(fmt::format("{} is not a texture copy destination", source));
-      return;
+      return false;
     }
     const auto& copy = it->second;
     const auto format = format_info(copy.key.format);
     const uint32_t size = byte_size(copy.key.format, copy.width, copy.height);
     if (!format || size == 0) {
       fail(fmt::format("native readback of copy format {:#x} is unsupported", static_cast<u32>(copy.key.format)));
-      return;
+      return false;
     }
     outputs.push_back({
         .key = key,
@@ -300,12 +304,11 @@ void handle_capture_copies(ByteReader& reader) {
     words += size / 4;
     if (words * 4 > MaxPayloadBytes) {
       fail("capture payload limit reached");
-      return;
+      return false;
     }
   }
 
-  auto job =
-      create_job(header.stream, header.sequence, JobKind::GxCopy, std::move(outputs), static_cast<uint32_t>(words * 4));
+  auto job = create_job(stream, sequence, JobKind::GxCopy, std::move(outputs), static_cast<uint32_t>(words * 4));
   job->copies.reserve(packs.size());
   for (auto& [texture, params] : packs) {
     job->copies.push_back({
@@ -316,7 +319,9 @@ void handle_capture_copies(ByteReader& reader) {
   }
   if (!gfx::push_readback_op(job, false)) {
     fail_job(*job, "could not record the copy readback");
+    return false;
   }
+  return true;
 }
 
 } // namespace aurora::gx::readback

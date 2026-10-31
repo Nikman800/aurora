@@ -56,6 +56,12 @@ void AuroraSetAddressResolver(AuroraAddressResolver resolver, void* userData) {
   aurora::gx::fifo::set_address_resolver(resolver, userData);
 }
 
+void AuroraSetCopyWriteback(AuroraCopyWriteback writeback, void* userData, bool captureSources) {
+  aurora::gx::fifo::set_copy_writeback(writeback, userData, captureSources);
+}
+
+u32 AuroraFlushCopyWriteback() { return aurora::gx::fifo::flush_copy_writeback(); }
+
 void AuroraSetDrawsBlocking(bool blocking) {
   GX_WRITE_AURORA(GX_AURORA_SET_DRAWS_BLOCKING);
   GX_WRITE_U8(blocking);
