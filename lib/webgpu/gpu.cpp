@@ -6,6 +6,8 @@
 #include <cmath>
 #include <map>
 #include <cstdint>
+#include <cctype>
+#include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
@@ -688,6 +690,58 @@ void resample(const wgpu::CommandEncoder& encoder, const TextureWithSampler& sou
   pass.End();
 }
 
+static std::string g_adapterList;
+
+static std::string lowercase(std::string_view s) {
+  std::string out{s};
+  std::ranges::transform(out, out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
+// AuroraConfig::adapterName: lists the adapters the instance offers for `options` (any power preference) and
+// replaces g_adapter with the one named: its index in that list, a type ("discrete", "integrated", "cpu"), or a
+// case-insensitive part of its name or driver description. Returns true when one was chosen.
+static bool select_named_adapter(const wgpu::RequestAdapterOptions& options) {
+  g_adapterList.clear();
+#ifndef WEBGPU_DAWN
+  return false;
+#else
+  const dawn::native::Instance native{reinterpret_cast<dawn::native::InstanceBase*>(g_instance.Get())};
+  wgpu::RequestAdapterOptions listOptions = options;
+  listOptions.powerPreference = wgpu::PowerPreference::Undefined;
+  const auto adapters = native.EnumerateAdapters(&listOptions);
+  const std::string wanted = g_config.adapterName != nullptr ? lowercase(g_config.adapterName) : std::string{};
+  const bool byIndex = !wanted.empty() && std::ranges::all_of(wanted, [](unsigned char c) { return std::isdigit(c); });
+  int chosen = -1;
+  for (size_t i = 0; i < adapters.size(); ++i) {
+    wgpu::Adapter adapter{adapters[i].Get()};
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    const std::string name{std::string_view{info.device}};
+    const std::string description{std::string_view{info.description}};
+    std::string type{magic_enum::enum_name(info.adapterType)};
+    const std::string typeLower = lowercase(type);
+    g_adapterList += fmt::format("{}: {} ({}, {}, {})\n", i, name, type, magic_enum::enum_name(info.backendType),
+                                 description);
+    if (chosen >= 0 || wanted.empty()) {
+      continue;
+    }
+    const bool match = byIndex ? std::to_string(i) == wanted
+                               : (typeLower.starts_with(wanted) || lowercase(name).find(wanted) != std::string::npos ||
+                                  lowercase(description).find(wanted) != std::string::npos);
+    if (match) {
+      chosen = static_cast<int>(i);
+      g_adapter = std::move(adapter);
+    }
+  }
+  Log.info("Adapters:\n{}", g_adapterList);
+  if (!wanted.empty() && chosen < 0) {
+    Log.warn("No adapter matches \"{}\"; using the default. Adapters:\n{}", g_config.adapterName, g_adapterList);
+  }
+  return chosen >= 0;
+#endif
+}
+
 static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
   switch (backend) {
   case BACKEND_WEBGPU:
@@ -814,6 +868,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         Log.error("Failed to create adapter: request callback did not complete");
       }
       return false;
+    }
+    if (select_named_adapter(options)) {
+      allowCpu = true; // chosen by name: a CPU adapter was asked for
     }
   }
   g_adapter.GetInfo(&g_adapterInfo);
@@ -1079,6 +1136,16 @@ void resize_efb(uint32_t width, uint32_t height) {
 void aurora_set_present_aspect(const float aspect) {
   aurora::webgpu::g_presentAspect.store(std::isfinite(aspect) && aspect > 0.f ? aspect : 0.f,
                                         std::memory_order_release);
+}
+
+size_t aurora_get_adapter_list(char* buffer, size_t size) {
+  const auto& list = aurora::webgpu::g_adapterList;
+  if (buffer != nullptr && size > 0) {
+    const size_t n = std::min(size - 1, list.size());
+    std::memcpy(buffer, list.data(), n);
+    buffer[n] = '\0';
+  }
+  return list.size();
 }
 
 void aurora_enable_vsync(const bool enabled) {

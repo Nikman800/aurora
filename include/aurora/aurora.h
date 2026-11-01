@@ -190,6 +190,12 @@ typedef struct {
    * being loaded. Defaults to 0.
    */
   uint32_t pipelineCacheKey;
+  /*
+   * Graphics adapter to use instead of the default (the high-performance one): its index in the list
+   * aurora_get_adapter_list returns, a type ("discrete", "integrated", "cpu"), or a case-insensitive part of its
+   * name or driver description. NULL or empty keeps the default; no match logs a warning and keeps it.
+   */
+  const char* adapterName;
 } AuroraConfig;
 
 typedef struct {

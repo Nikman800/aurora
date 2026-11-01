@@ -44,6 +44,12 @@ float aurora_get_fps();
 void aurora_enable_vsync(bool enabled);
 
 /**
+ * The adapters offered for the selected backend, one per line ("index: name (type, backend, driver)"), as
+ * AuroraConfig::adapterName counts them. Copies at most size - 1 bytes plus a terminator; returns the full length.
+ */
+size_t aurora_get_adapter_list(char* buffer, size_t size);
+
+/**
  * Display aspect ratio (width / height) the main framebuffer is presented at. The framebuffer is
  * letterboxed or pillarboxed into the window at this aspect instead of its own pixel aspect, as a TV
  * shows a 4:3 or anamorphic 16:9 picture from the same framebuffer. Zero (the default) presents
