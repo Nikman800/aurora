@@ -29,6 +29,13 @@ typedef struct {
   uint32_t lastIndexSize;
   uint32_t lastStorageSize;
   uint32_t lastTextureUploadSize;
+  /* Cumulative since initialisation (any thread): pipelines compiled and the time spent compiling them, draws that
+     waited for their pipeline (blocking draws) and the time they waited, draws skipped because their pipeline was
+     not ready (async pipelines). */
+  uint32_t pipelineWaits;
+  uint32_t skippedDraws;
+  uint64_t pipelineCompileNs;
+  uint64_t pipelineWaitNs;
 } AuroraStats;
 
 const AuroraStats* aurora_get_stats();

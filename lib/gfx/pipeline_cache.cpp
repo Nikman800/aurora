@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -426,6 +427,23 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
   return std::nullopt;
 }
 
+static uint64_t elapsed_ns(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+static void add_stat(uint64_t& stat, uint64_t value) { __atomic_add_fetch(&stat, value, __ATOMIC_RELAXED); }
+static void add_stat(uint32_t& stat, uint32_t value) { __atomic_add_fetch(&stat, value, __ATOMIC_RELAXED); }
+
+// Runs a pipeline creation and adds its duration to the statistics.
+template <typename Create>
+static auto timed_create(Create& create) {
+  const auto start = std::chrono::steady_clock::now();
+  auto result = create();
+  add_stat(detail::resources().stats.pipelineCompileNs, elapsed_ns(start));
+  return result;
+}
+
 static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
@@ -469,7 +487,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       if (blocking && !g_hasPipelineThread) {
         auto pending = take_pending_pipeline(runtimeKey);
         if (pending) {
-          auto result = pending->create();
+          auto result = timed_create(pending->create);
           pipelineCount = result.pipeline_count();
           g_pipelines.try_emplace(runtimeKey, std::move(result));
           pipelineReady = true;
@@ -482,7 +500,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
         notifyWorker = priority != PipelinePriority::Background;
       }
     } else if (!g_hasPipelineThread && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
-      auto result = cb();
+      auto result = timed_create(cb);
       pipelineCount = result.pipeline_count();
       g_pipelines.try_emplace(runtimeKey, std::move(result));
       pipelineReady = true;
@@ -519,8 +537,13 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   }
 
   if (blocking && !pipelineReady) {
-    std::unique_lock lock{g_pipelineMutex};
-    g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
+    const auto start = std::chrono::steady_clock::now();
+    {
+      std::unique_lock lock{g_pipelineMutex};
+      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
+    }
+    add_stat(detail::resources().stats.pipelineWaits, 1u);
+    add_stat(detail::resources().stats.pipelineWaitNs, elapsed_ns(start));
   }
   return runtimeKey;
 }
@@ -1009,7 +1032,7 @@ static void pipeline_worker() {
       pending = std::move(source.front());
       source.pop_front();
     }
-    auto result = pending.create();
+    auto result = timed_create(pending.create);
     const auto pipelineCount = result.pipeline_count();
     {
       std::lock_guard lock{g_pipelineMutex};
@@ -1232,6 +1255,7 @@ bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end() || !it->second.main) {
+    add_stat(detail::resources().stats.skippedDraws, 1u);
     return false;
   }
   pipeline = it->second;
