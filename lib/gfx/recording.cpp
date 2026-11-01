@@ -624,11 +624,29 @@ webgpu::TextureWithSampler display_source(const webgpu::TextureWithSampler& efb)
   return source;
 }
 
+// The last presentation's viewport and surface size (aurora_get_present_viewport)
+std::mutex g_presentViewportMutex;
+AuroraPresentViewport g_presentViewport{};
+
 present::Request record_present(present::TargetSnapshot target, webgpu::TextureWithSampler source,
                                 bool resample = true) {
   auto& frame = current_frame_packet();
   const auto viewport = webgpu::calculate_present_viewport(target.size.native_fb_width, target.size.native_fb_height,
                                                            source.size.width, source.size.height);
+  {
+    std::lock_guard lock{g_presentViewportMutex};
+    g_presentViewport = {
+        .left = viewport.left,
+        .top = viewport.top,
+        .width = viewport.width,
+        .height = viewport.height,
+        .surfaceWidth = target.size.native_fb_width,
+        .surfaceHeight = target.size.native_fb_height,
+        .windowWidth = target.size.width,
+        .windowHeight = target.size.height,
+        .valid = viewport.width > 0.f && viewport.height > 0.f,
+    };
+  }
   if (!resample) {
     return {
         .target = std::move(target),
@@ -1586,4 +1604,12 @@ void pop_debug_group() {
 
   aurora::gfx::g_recorder.debugGroupStack.pop_back();
 #endif
+}
+
+bool aurora_get_present_viewport(AuroraPresentViewport* out) {
+  std::lock_guard lock{aurora::gfx::g_presentViewportMutex};
+  if (out != nullptr) {
+    *out = aurora::gfx::g_presentViewport;
+  }
+  return aurora::gfx::g_presentViewport.valid;
 }

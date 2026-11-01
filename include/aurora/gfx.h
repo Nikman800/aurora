@@ -67,6 +67,26 @@ size_t aurora_get_adapter_list(char* buffer, size_t size);
  */
 void aurora_set_present_aspect(float aspect);
 
+/** Where the last presented frame went: the viewport inside the surface (pixels) and the sizes it was presented at. */
+typedef struct AuroraPresentViewport {
+  float left;
+  float top;
+  float width;
+  float height;
+  uint32_t surfaceWidth;  /* the surface (window) in pixels */
+  uint32_t surfaceHeight;
+  uint32_t windowWidth;   /* the window in logical units (points) at that time */
+  uint32_t windowHeight;
+  bool valid;
+} AuroraPresentViewport;
+
+/**
+ * The viewport and surface size of the last presentation (the letterbox / pillarbox the picture was drawn into), for
+ * mapping window coordinates (mouse) onto the picture. Returns false before the first presentation.
+ */
+bool aurora_get_present_viewport(AuroraPresentViewport* out);
+
+
 /**
  * Reads back the color contents of the main framebuffer (EFB) as of the last aurora_end_frame(), as RGBA8 rows from
  * top to bottom (width * 4 bytes per row). Waits for all submitted GPU work, so it is meant for tests and
