@@ -466,6 +466,38 @@ void set_vsync(bool enabled) noexcept {
   }
 }
 
+void reconfigure() noexcept {
+  const auto target = find_target(xfb_target());
+  if (!target) {
+    return;
+  }
+  std::lock_guard lock{target->configMutex};
+  ++target->revision;
+}
+
+const char* present_mode_name() noexcept {
+  const auto target = find_target(xfb_target());
+  if (!target) {
+    return "none";
+  }
+  std::lock_guard lock{target->configMutex};
+  if (target->presentModes.empty()) {
+    return "none";
+  }
+  switch (webgpu::select_present_mode(target->presentModes, target->vsync)) {
+  case wgpu::PresentMode::Fifo:
+    return "fifo";
+  case wgpu::PresentMode::FifoRelaxed:
+    return "fifo-relaxed";
+  case wgpu::PresentMode::Immediate:
+    return "immediate";
+  case wgpu::PresentMode::Mailbox:
+    return "mailbox";
+  default:
+    return "unknown";
+  }
+}
+
 void resize_sdl_target(PresentTargetId id, uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
                        float scale) noexcept {
   const auto target = find_target(id);

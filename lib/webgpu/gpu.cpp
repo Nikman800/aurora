@@ -65,6 +65,7 @@ bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
 static std::atomic_bool g_vsyncEnabled = true;
+static std::atomic_bool g_vsyncMailbox = false;
 static std::atomic<float> g_presentAspect = 0.f;
 
 namespace {
@@ -209,6 +210,11 @@ wgpu::PresentMode select_present_mode(std::span<const wgpu::PresentMode> modes, 
     return std::ranges::any_of(modes, [&](const wgpu::PresentMode mode) { return mode == candidate; });
   };
   if (vsync) {
+    // Synchronised without blocking the producer: the newest frame at each refresh
+    if (g_vsyncMailbox.load(std::memory_order_acquire) && g_backendType != wgpu::BackendType::Metal &&
+        supports(wgpu::PresentMode::Mailbox)) {
+      return wgpu::PresentMode::Mailbox;
+    }
     if (supports(wgpu::PresentMode::FifoRelaxed)) {
       return wgpu::PresentMode::FifoRelaxed;
     }
@@ -1147,6 +1153,13 @@ size_t aurora_get_adapter_list(char* buffer, size_t size) {
   }
   return list.size();
 }
+
+void aurora_set_vsync_mailbox(const bool mailbox) {
+  aurora::webgpu::g_vsyncMailbox.store(mailbox, std::memory_order_release);
+  aurora::gfx::present::reconfigure();
+}
+
+const char* aurora_get_present_mode() { return aurora::gfx::present::present_mode_name(); }
 
 void aurora_enable_vsync(const bool enabled) {
   aurora::webgpu::g_vsyncEnabled.store(enabled, std::memory_order_release);

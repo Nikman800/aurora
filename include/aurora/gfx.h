@@ -44,6 +44,16 @@ float aurora_get_fps();
 void aurora_enable_vsync(bool enabled);
 
 /**
+ * With vsync, prefer the mailbox present mode where the surface offers it: frames are still shown whole at a
+ * refresh, but presenting never waits for one (the application paces itself; the newest frame is shown). Off by
+ * default (FIFO relaxed / FIFO).
+ */
+void aurora_set_vsync_mailbox(bool mailbox);
+
+/** The present mode of the main window ("fifo", "fifo-relaxed", "mailbox", "immediate"; "none" headless). */
+const char* aurora_get_present_mode();
+
+/**
  * The adapters offered for the selected backend, one per line ("index: name (type, backend, driver)"), as
  * AuroraConfig::adapterName counts them. Copies at most size - 1 bytes plus a terminator; returns the full length.
  */

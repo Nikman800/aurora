@@ -38,6 +38,10 @@ TargetSnapshot snapshot(PresentTargetId id, bool primary = false);
 void submit(const Request& request);
 void shutdown();
 void set_vsync(bool enabled) noexcept;
+// The primary target picks its present mode again (aurora_set_vsync_mailbox).
+void reconfigure() noexcept;
+// The present mode the primary target uses ("none" without one).
+const char* present_mode_name() noexcept;
 bool bind_xfb_surface(wgpu::Surface&& surface, const AuroraSurfaceDesc& desc);
 bool replace_xfb_surface(const AuroraSurfaceDesc& desc);
 
