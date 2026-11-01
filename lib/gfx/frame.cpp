@@ -594,6 +594,59 @@ bool wait_for_staging_buffer(size_t slot) {
   }
 }
 
+// Frames in flight: frames ended on the CPU against frames whose GPU work
+// (including the presentation's) has completed. begin_frame waits while too
+// many are outstanding, so the picture cannot fall further and further behind
+// a CPU that keeps producing (aurora_set_max_frames_in_flight).
+std::atomic<uint64_t> g_framesEnded{0};
+std::atomic<uint64_t> g_framesDone{0};
+std::atomic<uint32_t> g_maxFramesInFlight{0}; // 0: no limit (the frame slots and staging buffers only)
+std::atomic<int64_t> g_lastGpuLatencyNs{0};   // the latest completed frame: end_frame to GPU done
+std::atomic<int64_t> g_gpuLatencySumNs{0};
+std::atomic<int64_t> g_gpuLatencyMaxNs{0};
+std::atomic<uint64_t> g_inFlightWaitNs{0};
+std::atomic<uint32_t> g_maxInFlightSeen{0};
+// Test load: GPU copies added to every frame (aurora_test_set_gpu_load)
+std::atomic<uint32_t> g_testGpuLoadMiB{0};
+std::atomic<uint32_t> g_testGpuLoadRepeats{0};
+wgpu::Buffer g_testLoadSrc, g_testLoadDst;
+uint64_t g_testLoadSize = 0;
+
+void wait_frames_in_flight() {
+  const uint32_t limit = g_maxFramesInFlight.load(std::memory_order_acquire);
+  if (limit == 0) {
+    return;
+  }
+  const auto start = PresentClock::now();
+  while (g_framesEnded.load(std::memory_order_acquire) - g_framesDone.load(std::memory_order_acquire) >= limit) {
+    enqueue_process_events();
+    std::this_thread::sleep_for(std::chrono::microseconds{100});
+  }
+  g_inFlightWaitNs.fetch_add(duration_ns(PresentClock::now() - start), std::memory_order_relaxed);
+}
+
+void add_test_gpu_load(wgpu::CommandEncoder& encoder) {
+  const uint32_t mib = g_testGpuLoadMiB.load(std::memory_order_acquire);
+  const uint32_t repeats = g_testGpuLoadRepeats.load(std::memory_order_acquire);
+  if (mib == 0 || repeats == 0 || !encoder) {
+    return;
+  }
+  const uint64_t size = static_cast<uint64_t>(mib) << 20;
+  if (g_testLoadSize != size) {
+    const wgpu::BufferDescriptor desc{
+        .label = "Test GPU load",
+        .usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+        .size = size,
+    };
+    g_testLoadSrc = g_device.CreateBuffer(&desc);
+    g_testLoadDst = g_device.CreateBuffer(&desc);
+    g_testLoadSize = size;
+  }
+  for (uint32_t i = 0; i < repeats; i++) {
+    encoder.CopyBufferToBuffer(g_testLoadSrc, 0, g_testLoadDst, 0, size);
+  }
+}
+
 size_t acquire_frame_slot() {
   ZoneScopedN("Acquire frame slot");
   const auto waitStart = PresentClock::now();
@@ -625,6 +678,7 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
 bool begin_frame() {
   ZoneScoped;
   // pace_frame_start();
+  wait_frames_in_flight();
   const size_t frameSlot = acquire_frame_slot();
   const auto stagingSlot = acquire_mapped_staging_buffer();
   if (!stagingSlot) {
@@ -683,7 +737,13 @@ void end_frame(EndFrameCallback callback) {
   ++g_frameIndex;
 
   const size_t stagingSlot = frame.stagingBuffer;
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
+  const uint64_t ended = g_framesEnded.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const uint64_t done = g_framesDone.load(std::memory_order_acquire);
+  const uint32_t inFlight = static_cast<uint32_t>(ended - done);
+  uint32_t seen = g_maxInFlightSeen.load(std::memory_order_relaxed);
+  while (inFlight > seen && !g_maxInFlightSeen.compare_exchange_weak(seen, inFlight, std::memory_order_relaxed)) {}
+  const auto endedAt = PresentClock::now();
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, endedAt, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
@@ -697,12 +757,25 @@ void end_frame(EndFrameCallback callback) {
     g_resources.stats.lastIndexSize = stats.lastIndexSize;
     g_resources.stats.lastStorageSize = stats.lastStorageSize;
     g_resources.stats.lastTextureUploadSize = stats.lastTextureUploadSize;
+    add_test_gpu_load(encoder);
     if (callback) {
       callback(encoder, std::move(afterSubmitCallbacks));
     }
     for (const auto& request : packet.presents) {
       present::submit(request);
     }
+    // This frame's GPU work, its presentation included, is done when the queue
+    // reaches this point
+    webgpu::g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                        [endedAt](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                          const int64_t ns = duration_ns(PresentClock::now() - endedAt);
+                                          g_lastGpuLatencyNs.store(ns, std::memory_order_release);
+                                          g_gpuLatencySumNs.fetch_add(ns, std::memory_order_relaxed);
+                                          int64_t mx = g_gpuLatencyMaxNs.load(std::memory_order_relaxed);
+                                          while (ns > mx && !g_gpuLatencyMaxNs.compare_exchange_weak(
+                                                                mx, ns, std::memory_order_relaxed)) {}
+                                          g_framesDone.fetch_add(1, std::memory_order_acq_rel);
+                                        });
     webgpu::gpu_prof::frame_end();
     webgpu::gpu_prof::after_submit();
     packet = {};
@@ -751,3 +824,27 @@ float calculate_fps() noexcept {
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::detail::resources().stats; }
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
+
+void aurora_set_max_frames_in_flight(uint32_t frames) {
+  aurora::gfx::g_maxFramesInFlight.store(frames, std::memory_order_release);
+}
+
+void aurora_get_frame_stats(AuroraFrameStats* out) {
+  if (out == nullptr) {
+    return;
+  }
+  using namespace aurora::gfx;
+  out->framesEnded = g_framesEnded.load(std::memory_order_acquire);
+  out->framesDone = g_framesDone.load(std::memory_order_acquire);
+  out->lastGpuLatencyNs = static_cast<uint64_t>(std::max<int64_t>(0, g_lastGpuLatencyNs.load(std::memory_order_acquire)));
+  out->gpuLatencySumNs = static_cast<uint64_t>(std::max<int64_t>(0, g_gpuLatencySumNs.load(std::memory_order_acquire)));
+  out->gpuLatencyMaxNs = static_cast<uint64_t>(std::max<int64_t>(0, g_gpuLatencyMaxNs.load(std::memory_order_acquire)));
+  out->inFlightWaitNs = g_inFlightWaitNs.load(std::memory_order_acquire);
+  out->maxInFlightSeen = g_maxInFlightSeen.load(std::memory_order_acquire);
+  out->maxFramesInFlight = g_maxFramesInFlight.load(std::memory_order_acquire);
+}
+
+void aurora_test_set_gpu_load(uint32_t mib, uint32_t repeats) {
+  aurora::gfx::g_testGpuLoadMiB.store(mib, std::memory_order_release);
+  aurora::gfx::g_testGpuLoadRepeats.store(repeats, std::memory_order_release);
+}

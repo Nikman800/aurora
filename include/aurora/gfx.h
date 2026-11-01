@@ -86,6 +86,27 @@ typedef struct AuroraPresentViewport {
  */
 bool aurora_get_present_viewport(AuroraPresentViewport* out);
 
+/**
+ * Limits the frames in flight: aurora_begin_frame() waits until fewer than `frames` ended frames have GPU work
+ * (their presentation included) outstanding. 0 (the default) leaves only the internal frame slots and staging
+ * buffers as a bound. 1 waits for the previous frame's GPU work before starting the next.
+ */
+void aurora_set_max_frames_in_flight(uint32_t frames);
+
+typedef struct AuroraFrameStats {
+  uint64_t framesEnded;      /* aurora_end_frame calls */
+  uint64_t framesDone;       /* frames whose GPU work has completed */
+  uint64_t lastGpuLatencyNs; /* the latest completed frame: from aurora_end_frame to its GPU work done */
+  uint64_t gpuLatencySumNs;  /* sum over the completed frames */
+  uint64_t gpuLatencyMaxNs;
+  uint64_t inFlightWaitNs;   /* time aurora_begin_frame waited for the frames-in-flight limit */
+  uint32_t maxInFlightSeen;  /* the most frames outstanding at an aurora_end_frame */
+  uint32_t maxFramesInFlight;
+} AuroraFrameStats;
+void aurora_get_frame_stats(AuroraFrameStats* out);
+
+/** Tests: adds `repeats` copies of a `mib` MiB buffer to every frame's GPU work (a slow GPU). 0 turns it off. */
+void aurora_test_set_gpu_load(uint32_t mib, uint32_t repeats);
 
 /**
  * Reads back the color contents of the main framebuffer (EFB) as of the last aurora_end_frame(), as RGBA8 rows from

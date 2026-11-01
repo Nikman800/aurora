@@ -1,5 +1,8 @@
 #include "present_target.hpp"
 
+#include <magic_enum.hpp>
+#include <string>
+
 #include "efb.hpp"
 #include "frame.hpp"
 #include "render_worker.hpp"
@@ -306,6 +309,15 @@ void submit(const Request& request) {
         .presentMode = snapshot.presentMode,
     };
     target.surface.Configure(&target.applied);
+    {
+      std::string modes;
+      for (const auto m : target.presentModes) {
+        modes += modes.empty() ? "" : " ";
+        modes += magic_enum::enum_name(m);
+      }
+      Log.info("surface configured: {}x{} px, present mode {} (surface supports: {})", width, height,
+               magic_enum::enum_name(snapshot.presentMode), modes);
+    }
     target.appliedRevision = snapshot.revision;
     target.dirty = false;
   }
