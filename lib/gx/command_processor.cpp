@@ -33,69 +33,57 @@ namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 
 u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
+  // Triangle-list indices written straight into the buffer (this runs for every draw)
+  const auto out = [&buf](u32 count) { return reinterpret_cast<u16*>(buf.append_uninitialized(count * sizeof(u16))); };
   u16 numIndices = 0;
   if (prim == GX_QUADS) {
-    buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
-
+    u16* idx = out(((u32(vtxCount) + 3) / 4) * 6);
     for (u16 v = 0; v < vtxCount; v += 4) {
-      u16 idx0 = vtxStart + v;
-      u16 idx1 = vtxStart + v + 1;
-      u16 idx2 = vtxStart + v + 2;
-      u16 idx3 = vtxStart + v + 3;
-
-      buf.append(idx0);
-      buf.append(idx1);
-      buf.append(idx2);
-      numIndices += 3;
-
-      buf.append(idx2);
-      buf.append(idx3);
-      buf.append(idx0);
-      numIndices += 3;
+      const u16 idx0 = vtxStart + v;
+      *idx++ = idx0;
+      *idx++ = idx0 + 1;
+      *idx++ = idx0 + 2;
+      *idx++ = idx0 + 2;
+      *idx++ = idx0 + 3;
+      *idx++ = idx0;
+      numIndices += 6;
     }
   } else if (prim == GX_TRIANGLES) {
-    buf.reserve_extra(vtxCount * sizeof(u16));
+    u16* idx = out(vtxCount);
     for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      buf.append(idx);
-      ++numIndices;
+      *idx++ = vtxStart + v;
     }
-  } else if (prim == GX_TRIANGLEFAN) {
-    buf.reserve_extra(((u32(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
-      }
-      buf.append(std::array{vtxStart, static_cast<u16>(idx - 1), idx});
-      numIndices += 3;
+    numIndices = vtxCount;
+  } else if (prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) {
+    const u32 head = std::min<u32>(vtxCount, 3);
+    u16* idx = out(head + (vtxCount - head) * 3);
+    for (u16 v = 0; v < head; ++v) {
+      *idx++ = vtxStart + v;
     }
-  } else if (prim == GX_TRIANGLESTRIP) {
-    buf.reserve_extra(((static_cast<u32>(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
+    numIndices = head;
+    if (prim == GX_TRIANGLEFAN) {
+      for (u16 v = 3; v < vtxCount; ++v) {
+        const u16 i = vtxStart + v;
+        *idx++ = vtxStart;
+        *idx++ = i - 1;
+        *idx++ = i;
+        numIndices += 3;
       }
-      if ((v & 1) == 0) {
-        buf.append(std::array{static_cast<u16>(idx - 2), static_cast<u16>(idx - 1), idx});
-      } else {
-        buf.append(std::array{static_cast<u16>(idx - 1), static_cast<u16>(idx - 2), idx});
+    } else {
+      for (u16 v = 3; v < vtxCount; ++v) {
+        const u16 i = vtxStart + v;
+        // Every other triangle swaps its first two vertices to keep the winding
+        *idx++ = (v & 1) == 0 ? i - 2 : i - 1;
+        *idx++ = (v & 1) == 0 ? i - 1 : i - 2;
+        *idx++ = i;
+        numIndices += 3;
       }
-      numIndices += 3;
     }
   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
-    buf.reserve_extra(6 * sizeof(u16));
-    buf.append<u16>(0);
-    buf.append<u16>(1);
-    buf.append<u16>(3);
-    buf.append<u16>(3);
-    buf.append<u16>(2);
-    buf.append<u16>(0);
+    u16* idx = out(6);
+    for (const u16 i : {0, 1, 3, 3, 2, 0}) {
+      *idx++ = i;
+    }
     numIndices = 6;
   } else
     UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
@@ -609,27 +597,54 @@ static ProcessResult process_commands(const u8* data, u32 size, u32 depth) noexc
   FATAL("draw vertex data overrun: need {} bytes at pos {}, have {}", totalVtxBytes, pos, reader.remaining());
 }
 
+// The indexed attributes of the vertex format calc_vtx_size last measured (g_gxState.lastVtxFmt):
+// where each index sits in a vertex, for size_guest_arrays.
+struct IndexedAttr {
+  u8 attr;
+  u8 offset;
+  u8 idxSize; // 1 or 2 bytes
+  u8 numIdx;  // 3 for NBT3 normals
+  u32 elemSize;
+};
+std::array<IndexedAttr, GX_VA_TEX7 + 1> sIndexedAttrs;
+u32 sIndexedAttrCount = 0;
+u64 sIndexedLayout = 0; // the vertex size and where the indices are: a key for sMaxIndexCache
+
 static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   u32 vtxSize = 0;
+  sIndexedAttrCount = 0;
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
     const auto& attrFmt = vtxFmt.attrs[i];
     switch (g_gxState.vtxDesc[i]) {
     case GX_NONE:
       break;
     case GX_DIRECT: {
-      const auto attr = static_cast<GXAttr>(i);
       vtxSize += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
       break;
     }
     case GX_INDEX8:
-      vtxSize += i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3 ? 3 : 1;
-      break;
-    case GX_INDEX16:
-      vtxSize += i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3 ? 6 : 2;
+    case GX_INDEX16: {
+      const bool nbt3 = i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
+      const u32 idxSize = g_gxState.vtxDesc[i] == GX_INDEX16 ? 2 : 1;
+      u32 elemSize = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      if (nbt3) {
+        elemSize /= 3;
+      }
+      sIndexedAttrs[sIndexedAttrCount++] = {
+          .attr = static_cast<u8>(i),
+          .offset = static_cast<u8>(vtxSize),
+          .idxSize = static_cast<u8>(idxSize),
+          .numIdx = static_cast<u8>(nbt3 ? 3 : 1),
+          .elemSize = elemSize,
+      };
+      vtxSize += idxSize * (nbt3 ? 3 : 1);
       break;
     }
+    }
   }
+  sIndexedLayout = XXH3_64bits_withSeed(sIndexedAttrs.data(), sIndexedAttrCount * sizeof(IndexedAttr), vtxSize);
   g_gxState.lastVtxFmt = fmt;
   g_gxState.lastVtxSize = vtxSize;
   return vtxSize;
@@ -749,47 +764,71 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 }
 
 // Arrays set by CP array base registers have no size: make what is uploaded cover the
-// largest index this draw uses.
-static void size_guest_arrays(GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* vtxData) noexcept {
+// largest index this draw uses. The attributes come from calc_vtx_size (the draw's format is
+// the one it last measured).
+template <typename Idx>
+static u32 max_index(const u8* p, u16 vtxCount, u32 vtxSize, u32 numIdx) noexcept {
+  u32 maxIdx = 0;
+  for (u32 v = 0; v < vtxCount; ++v, p += vtxSize) {
+    for (u32 k = 0; k < numIdx; ++k) {
+      u32 idx;
+      if constexpr (sizeof(Idx) == 2) {
+        idx = static_cast<u32>(p[2 * k]) << 8 | p[2 * k + 1];
+      } else {
+        idx = p[k];
+      }
+      maxIdx = std::max(maxIdx, idx);
+    }
+  }
+  return maxIdx;
+}
+
+// The largest indices of a draw's vertices, by their contents: the models draw the same vertices
+// every frame, and hashing them is far cheaper than reading every index. Direct-mapped by the
+// hash of the bytes, the vertex count and the layout.
+struct MaxIndexEntry {
+  u32 vtxCount = 0;
+  u64 layout = 0;
+  u64 hash = 0;
+  std::array<u32, GX_VA_TEX7 + 1> maxIdx{};
+};
+std::array<MaxIndexEntry, 4096> sMaxIndexCache;
+
+static void size_guest_arrays(u16 vtxCount, u32 vtxSize, const u8* vtxData) noexcept {
   auto& state = g_gxState;
-  const auto& vtxFmt = state.vtxFmts[fmt];
-  u32 offset = 0;
-  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
-    const auto attr = static_cast<GXAttr>(i);
-    const auto& attrFmt = vtxFmt.attrs[i];
-    const GXAttrType type = state.vtxDesc[i];
-    if (type == GX_NONE) {
+  bool any = false;
+  for (u32 n = 0; n < sIndexedAttrCount && !any; ++n) {
+    const auto& array = state.arrays[sIndexedAttrs[n].attr];
+    any = array.guest && array.data != nullptr && array.size < array.guestAvailable;
+  }
+  if (!any) {
+    return;
+  }
+  const u64 hash = XXH3_64bits(vtxData, static_cast<size_t>(vtxCount) * vtxSize);
+  auto& entry = sMaxIndexCache[(hash ^ sIndexedLayout ^ vtxCount) % sMaxIndexCache.size()];
+  if (entry.vtxCount != vtxCount || entry.layout != sIndexedLayout || entry.hash != hash) {
+    entry.vtxCount = vtxCount;
+    entry.layout = sIndexedLayout;
+    entry.hash = hash;
+    for (u32 n = 0; n < sIndexedAttrCount; ++n) {
+      const auto& ia = sIndexedAttrs[n];
+      const u8* p = vtxData + ia.offset;
+      entry.maxIdx[n] = ia.idxSize == 2 ? max_index<u16>(p, vtxCount, vtxSize, ia.numIdx)
+                                        : max_index<u8>(p, vtxCount, vtxSize, ia.numIdx);
+    }
+  }
+  for (u32 n = 0; n < sIndexedAttrCount; ++n) {
+    const auto& ia = sIndexedAttrs[n];
+    auto& array = state.arrays[ia.attr];
+    if (!array.guest || array.data == nullptr || array.size >= array.guestAvailable) {
       continue;
     }
-    if (type == GX_DIRECT) {
-      offset += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
-      continue;
+    const u32 needed = std::min((entry.maxIdx[n] * array.stride + ia.elemSize + 31) & ~31u, array.guestAvailable);
+    if (needed > array.size) {
+      array.size = needed;
+      array.cachedRange = {};
+      state.dirty |= DirtyImmediates;
     }
-    const bool nbt3 = i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
-    const u32 idxSize = type == GX_INDEX16 ? 2 : 1;
-    const u32 numIdx = nbt3 ? 3 : 1;
-    auto& array = state.arrays[i];
-    if (array.guest && array.data != nullptr) {
-      u32 maxIdx = 0;
-      for (u32 v = 0; v < vtxCount; ++v) {
-        const u8* p = vtxData + v * vtxSize + offset;
-        for (u32 k = 0; k < numIdx; ++k) {
-          const u32 idx = idxSize == 2 ? (static_cast<u32>(p[2 * k]) << 8 | p[2 * k + 1]) : p[k];
-          maxIdx = std::max(maxIdx, idx);
-        }
-      }
-      u32 elemSize = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
-      if (nbt3) {
-        elemSize /= 3;
-      }
-      const u32 needed = std::min((maxIdx * array.stride + elemSize + 31) & ~31u, array.guestAvailable);
-      if (needed > array.size) {
-        array.size = needed;
-        array.cachedRange = {};
-        state.dirty |= DirtyImmediates;
-      }
-    }
-    offset += idxSize * numIdx;
   }
 }
 
@@ -805,7 +844,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
   if (has_address_resolver()) {
-    size_guest_arrays(fmt, vtxCount, vtxSize, reader.data() + reader.offset());
+    size_guest_arrays(vtxCount, vtxSize, reader.data() + reader.offset());
   }
 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&

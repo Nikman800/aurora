@@ -313,6 +313,13 @@ public:
 
   void clear() { m_length = 0; }
   void reserve_extra(size_t size) { resize(m_length + size, true); }
+  // Extends the buffer by `size` bytes left for the caller to write, and returns them.
+  [[nodiscard]] uint8_t* append_uninitialized(size_t size) {
+    resize(m_length + size, false);
+    uint8_t* out = m_data + m_length;
+    m_length += size;
+    return out;
+  }
 
   ByteBuffer clone() const {
     ByteBuffer clone{m_length};
