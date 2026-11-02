@@ -594,8 +594,8 @@ bool wait_for_staging_buffer(size_t slot) {
   }
 }
 
-// Frames in flight: frames ended on the CPU against frames whose GPU work
-// (including the presentation's) has completed. begin_frame waits while too
+// Frames in flight: frames ended on the CPU against frames whose rendering on
+// the GPU has completed (the presentation is not waited for). begin_frame waits while too
 // many are outstanding, so the picture cannot fall further and further behind
 // a CPU that keeps producing (aurora_set_max_frames_in_flight).
 std::atomic<uint64_t> g_framesEnded{0};
@@ -606,6 +606,8 @@ std::atomic<int64_t> g_gpuLatencySumNs{0};
 std::atomic<int64_t> g_gpuLatencyMaxNs{0};
 std::atomic<uint64_t> g_inFlightWaitNs{0};
 std::atomic<uint32_t> g_maxInFlightSeen{0};
+std::atomic<int64_t> g_lastQueueLatencyNs{0};
+std::atomic<int64_t> g_lastRenderLatencyNs{0};
 // Test load: GPU copies added to every frame (aurora_test_set_gpu_load)
 std::atomic<uint32_t> g_testGpuLoadMiB{0};
 std::atomic<uint32_t> g_testGpuLoadRepeats{0};
@@ -744,6 +746,7 @@ void end_frame(EndFrameCallback callback) {
   while (inFlight > seen && !g_maxInFlightSeen.compare_exchange_weak(seen, inFlight, std::memory_order_relaxed)) {}
   const auto endedAt = PresentClock::now();
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, endedAt, callback = std::move(callback)]() mutable {
+    g_lastQueueLatencyNs.store(duration_ns(PresentClock::now() - endedAt), std::memory_order_release);
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
@@ -761,7 +764,20 @@ void end_frame(EndFrameCallback callback) {
     if (callback) {
       callback(encoder, std::move(afterSubmitCallbacks));
     }
-    for (const auto& request : packet.presents) {
+    // The frame's rendering is done when the queue reaches this point: that is what the
+    // frames-in-flight limit counts. Its presentation is not: acquiring the window's next image
+    // waits for the compositor to release one, which can take up to a refresh, and a game thread
+    // waiting for that runs in step with the compositor instead of its own clock.
+    webgpu::g_queue.OnSubmittedWorkDone(
+        wgpu::CallbackMode::AllowSpontaneous, [endedAt](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+          g_lastRenderLatencyNs.store(duration_ns(PresentClock::now() - endedAt), std::memory_order_release);
+          g_framesDone.fetch_add(1, std::memory_order_acq_rel);
+        });
+    auto presents = std::move(packet.presents);
+    packet = {};
+    g_frameSlots.release(frameSlot);
+    map_staging_buffer(stagingSlot, true);
+    for (const auto& request : presents) {
       present::submit(request);
     }
     // This frame's GPU work, its presentation included, is done when the queue
@@ -774,14 +790,10 @@ void end_frame(EndFrameCallback callback) {
                                           int64_t mx = g_gpuLatencyMaxNs.load(std::memory_order_relaxed);
                                           while (ns > mx && !g_gpuLatencyMaxNs.compare_exchange_weak(
                                                                 mx, ns, std::memory_order_relaxed)) {}
-                                          g_framesDone.fetch_add(1, std::memory_order_acq_rel);
                                         });
     webgpu::gpu_prof::frame_end();
     webgpu::gpu_prof::after_submit();
-    packet = {};
-    g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
-    map_staging_buffer(stagingSlot, true);
     process_events();
   });
 }
@@ -842,6 +854,11 @@ void aurora_get_frame_stats(AuroraFrameStats* out) {
   out->inFlightWaitNs = g_inFlightWaitNs.load(std::memory_order_acquire);
   out->maxInFlightSeen = g_maxInFlightSeen.load(std::memory_order_acquire);
   out->maxFramesInFlight = g_maxFramesInFlight.load(std::memory_order_acquire);
+  out->lastQueueLatencyNs = static_cast<uint64_t>(std::max<int64_t>(0, g_lastQueueLatencyNs.load(std::memory_order_acquire)));
+  out->lastRenderLatencyNs =
+      static_cast<uint64_t>(std::max<int64_t>(0, g_lastRenderLatencyNs.load(std::memory_order_acquire)));
+  out->acquireNs = present::g_acquireNs.load(std::memory_order_acquire);
+  out->presentNs = present::g_presentNs.load(std::memory_order_acquire);
 }
 
 void aurora_test_set_gpu_load(uint32_t mib, uint32_t repeats) {

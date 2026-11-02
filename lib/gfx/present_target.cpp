@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <string>
@@ -23,6 +24,8 @@
 
 namespace aurora::gfx {
 namespace present {
+std::atomic<uint64_t> g_acquireNs{0};
+std::atomic<uint64_t> g_presentNs{0};
 
 struct TargetState {
   std::mutex mutex;
@@ -325,7 +328,11 @@ void submit(const Request& request) {
   wgpu::SurfaceTexture surfaceTexture;
   {
     ZoneScopedN("Acquire texture");
+    const auto start = std::chrono::steady_clock::now();
     target.surface.GetCurrentTexture(&surfaceTexture);
+    g_acquireNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                              .count(),
+                          std::memory_order_relaxed);
   }
 
   switch (surfaceTexture.status) {
@@ -419,7 +426,11 @@ void submit(const Request& request) {
   wgpu::ConvertibleStatus status = wgpu::Status::Error;
   {
     ZoneScopedN("Present");
+    const auto start = std::chrono::steady_clock::now();
     status = target.surface.Present();
+    g_presentNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                              .count(),
+                          std::memory_order_relaxed);
   }
   if (status) {
     target.status = PresentTargetStatus::Ready;

@@ -5,6 +5,8 @@
 #include "../webgpu/gpu.hpp"
 #include "../imgui.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 
 namespace aurora::gfx::present {
@@ -36,6 +38,9 @@ struct Request {
 
 TargetSnapshot snapshot(PresentTargetId id, bool primary = false);
 void submit(const Request& request);
+// Render-thread time acquiring surface textures and in Surface::Present (cumulative, ns)
+extern std::atomic<uint64_t> g_acquireNs;
+extern std::atomic<uint64_t> g_presentNs;
 void shutdown();
 void set_vsync(bool enabled) noexcept;
 // The primary target picks its present mode again (aurora_set_vsync_mailbox).

@@ -87,21 +87,30 @@ typedef struct AuroraPresentViewport {
 bool aurora_get_present_viewport(AuroraPresentViewport* out);
 
 /**
- * Limits the frames in flight: aurora_begin_frame() waits until fewer than `frames` ended frames have GPU work
- * (their presentation included) outstanding. 0 (the default) leaves only the internal frame slots and staging
- * buffers as a bound. 1 waits for the previous frame's GPU work before starting the next.
+ * Limits the frames in flight: aurora_begin_frame() waits until fewer than `frames` ended frames have rendering
+ * outstanding on the GPU. Their presentation is not waited for: acquiring the surface's next texture waits for the
+ * compositor, which would put the caller in step with it. 0 (the default) leaves only the internal frame slots and
+ * staging buffers as a bound. 1 waits for the previous frame's rendering before starting the next.
  */
 void aurora_set_max_frames_in_flight(uint32_t frames);
 
 typedef struct AuroraFrameStats {
   uint64_t framesEnded;      /* aurora_end_frame calls */
-  uint64_t framesDone;       /* frames whose GPU work has completed */
-  uint64_t lastGpuLatencyNs; /* the latest completed frame: from aurora_end_frame to its GPU work done */
+  uint64_t framesDone;       /* frames whose rendering has completed */
+  uint64_t lastGpuLatencyNs; /* the latest presented frame: from aurora_end_frame to its GPU work (presentation
+                                included) done, as seen by the render thread */
   uint64_t gpuLatencySumNs;  /* sum over the completed frames */
   uint64_t gpuLatencyMaxNs;
   uint64_t inFlightWaitNs;   /* time aurora_begin_frame waited for the frames-in-flight limit */
   uint32_t maxInFlightSeen;  /* the most frames outstanding at an aurora_end_frame */
   uint32_t maxFramesInFlight;
+  /* The latest frame on the render thread, from aurora_end_frame: until its recording started (the queue), until
+     its rendering (presentation excluded) was done on the GPU */
+  uint64_t lastQueueLatencyNs;
+  uint64_t lastRenderLatencyNs;
+  /* Cumulative render-thread time acquiring the surface's next texture and in Surface::Present */
+  uint64_t acquireNs;
+  uint64_t presentNs;
 } AuroraFrameStats;
 void aurora_get_frame_stats(AuroraFrameStats* out);
 
