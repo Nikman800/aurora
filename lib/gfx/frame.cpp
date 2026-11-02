@@ -745,7 +745,8 @@ void end_frame(EndFrameCallback callback) {
   uint32_t seen = g_maxInFlightSeen.load(std::memory_order_relaxed);
   while (inFlight > seen && !g_maxInFlightSeen.compare_exchange_weak(seen, inFlight, std::memory_order_relaxed)) {}
   const auto endedAt = PresentClock::now();
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, endedAt, callback = std::move(callback)]() mutable {
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, ended, endedAt,
+                                             callback = std::move(callback)]() mutable {
     g_lastQueueLatencyNs.store(duration_ns(PresentClock::now() - endedAt), std::memory_order_release);
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
@@ -777,6 +778,15 @@ void end_frame(EndFrameCallback callback) {
     packet = {};
     g_frameSlots.release(frameSlot);
     map_staging_buffer(stagingSlot, true);
+    if (!presents.empty() && g_maxFramesInFlight.load(std::memory_order_acquire) != 0) {
+      // Report the rendering done before the acquire, which can block this thread for up to a refresh:
+      // the callback would only run after it, and hold the game back for that long.
+      ZoneScopedN("Wait for rendering");
+      while (g_framesDone.load(std::memory_order_acquire) < ended) {
+        process_events();
+        std::this_thread::sleep_for(std::chrono::microseconds{200});
+      }
+    }
     for (const auto& request : presents) {
       present::submit(request);
     }
