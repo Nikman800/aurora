@@ -30,9 +30,19 @@
 #include "../window.hpp"
 #include "gpu_prof.hpp"
 
+// A prebuilt Dawn DLL built with MSVC, used from a MinGW (GCC) build: only its C API
+// (webgpu.h) links. Its C++ API (dawn::native) has MSVC's name mangling and standard
+// library, so the instance descriptor is built from the C layout and the adapters are
+// listed through the C API.
+#if defined(WEBGPU_DAWN) && defined(__MINGW32__)
+#define AURORA_DAWN_C_API_ONLY 1
+#endif
+
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
+#ifndef AURORA_DAWN_C_API_ONLY
 #include <dawn/native/DawnNative.h>
+#endif
 #endif
 
 namespace aurora::webgpu {
@@ -707,20 +717,64 @@ static std::string lowercase(std::string_view s) {
 // AuroraConfig::adapterName: lists the adapters the instance offers for `options` (any power preference) and
 // replaces g_adapter with the one named: its index in that list, a type ("discrete", "integrated", "cpu"), or a
 // case-insensitive part of its name or driver description. Returns true when one was chosen.
+#ifdef AURORA_DAWN_C_API_ONLY
+// The adapters the C API hands out for `options` with each power preference, with and
+// without the fallback (software) adapter; one entry per distinct adapter.
+static std::vector<wgpu::Adapter> enumerate_adapters_c(const wgpu::RequestAdapterOptions& options) {
+  std::vector<wgpu::Adapter> adapters;
+  std::vector<std::array<uint32_t, 4>> seen;
+  for (const auto power : {wgpu::PowerPreference::HighPerformance, wgpu::PowerPreference::LowPower}) {
+    for (const bool fallback : {false, true}) {
+      wgpu::RequestAdapterOptions request = options;
+      request.powerPreference = power;
+      request.forceFallbackAdapter = fallback;
+      wgpu::Adapter found;
+      const auto future = g_instance.RequestAdapter(
+          &request, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView) {
+            if (status == wgpu::RequestAdapterStatus::Success) {
+              found = std::move(adapter);
+            }
+          });
+      if (g_instance.WaitAny(future, 5000000000) != wgpu::WaitStatus::Success || !found) {
+        continue;
+      }
+      wgpu::AdapterInfo info;
+      found.GetInfo(&info);
+      const std::array<uint32_t, 4> key{info.vendorID, info.deviceID, static_cast<uint32_t>(info.backendType),
+                                        static_cast<uint32_t>(info.adapterType)};
+      if (std::ranges::find(seen, key) == seen.end()) {
+        seen.push_back(key);
+        adapters.push_back(std::move(found));
+      }
+    }
+  }
+  return adapters;
+}
+#endif
+
 static bool select_named_adapter(const wgpu::RequestAdapterOptions& options) {
   g_adapterList.clear();
 #ifndef WEBGPU_DAWN
   return false;
 #else
+#ifdef AURORA_DAWN_C_API_ONLY
+  const auto adapters = enumerate_adapters_c(options);
+#else
   const dawn::native::Instance native{reinterpret_cast<dawn::native::InstanceBase*>(g_instance.Get())};
   wgpu::RequestAdapterOptions listOptions = options;
   listOptions.powerPreference = wgpu::PowerPreference::Undefined;
   const auto adapters = native.EnumerateAdapters(&listOptions);
+#endif
   const std::string wanted = g_config.adapterName != nullptr ? lowercase(g_config.adapterName) : std::string{};
   const bool byIndex = !wanted.empty() && std::ranges::all_of(wanted, [](unsigned char c) { return std::isdigit(c); });
   int chosen = -1;
   for (size_t i = 0; i < adapters.size(); ++i) {
+#ifdef AURORA_DAWN_C_API_ONLY
+    wgpu::Adapter adapter = adapters[i];
+#else
     wgpu::Adapter adapter{adapters[i].Get()};
+#endif
     wgpu::AdapterInfo info;
     adapter.GetInfo(&info);
     const std::string name{std::string_view{info.device}};
@@ -792,6 +846,27 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .enabledToggleCount = instanceToggles.size(),
         .enabledToggles = instanceToggles.data(),
     }};
+#ifdef AURORA_DAWN_C_API_ONLY
+    // dawn::native::DawnInstanceDescriptor's layout (DawnNative.h): a chained struct,
+    // then these members; its constructor only sets the sType.
+    struct {
+      WGPUChainedStruct chain;
+      uint32_t additionalRuntimeSearchPathsCount;
+      const char* const* additionalRuntimeSearchPaths;
+      void* platform;
+      int backendValidationLevel; // dawn::native::BackendValidationLevel: Full, Partial, Disabled
+      bool beginCaptureOnStartup;
+      WGPULoggingCallbackInfo loggingCallbackInfo;
+    } dawnInstanceDescriptor{};
+    dawnInstanceDescriptor.chain.sType = WGPUSType_DawnInstanceDescriptor;
+    dawnInstanceDescriptor.chain.next = reinterpret_cast<WGPUChainedStruct*>(&instanceTogglesDescriptor);
+    dawnInstanceDescriptor.backendValidationLevel = 2; // Disabled
+    dawnInstanceDescriptor.loggingCallbackInfo.callback = [](WGPULoggingType type, WGPUStringView message, void*,
+                                                             void*) {
+      wgpu_log(static_cast<wgpu::LoggingType>(type), wgpu::StringView{message});
+    };
+    instanceDescriptor.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&dawnInstanceDescriptor);
+#else
     dawn::native::DawnInstanceDescriptor dawnInstanceDescriptor{};
     dawnInstanceDescriptor.nextInChain = &instanceTogglesDescriptor;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -806,6 +881,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     dawnInstanceDescriptor.platform = tracy_dawn_platform();
 #endif
     instanceDescriptor.nextInChain = &dawnInstanceDescriptor;
+#endif
 #endif
     g_instance = wgpu::CreateInstance(&instanceDescriptor);
     if (!g_instance) {
